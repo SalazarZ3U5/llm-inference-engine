@@ -39,6 +39,8 @@ add_library(ie_core
   src/weights.cpp
   src/ops.cpp
   src/model.cpp
+  src/tokenizer.cpp
+  src/sampler.cpp
 )
 target_include_directories(ie_core PUBLIC src)
 target_link_libraries(ie_core PUBLIC nlohmann_json::nlohmann_json)

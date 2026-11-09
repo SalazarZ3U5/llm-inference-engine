@@ -65,34 +65,35 @@ void softmax(float* x, int n) {
 
 float silu(float x) { return x / (1.0f + std::exp(-x)); }
 
-void attention(float* out, const float* q, const float* k, const float* v, int T, int n_heads,
-               int n_kv_heads, int head_dim) {
+void attention(float* out, const float* q, const float* k, const float* v, int T, int pos0,
+               int n_heads, int n_kv_heads, int head_dim) {
   const int group = n_heads / n_kv_heads;          // query heads per KV head
   const float scale = 1.0f / std::sqrt(float(head_dim));
   const size_t q_stride = size_t(n_heads) * head_dim;   // floats per token in q / out
   const size_t kv_stride = size_t(n_kv_heads) * head_dim;  // floats per token in k / v
-  std::vector<float> scores(T);
+  std::vector<float> scores(size_t(pos0) + T);
 
   for (int h = 0; h < n_heads; ++h) {
     const int kvh = h / group;  // GQA: which KV head this query head shares
     for (int t = 0; t < T; ++t) {
+      const int p = pos0 + t;  // absolute position of this query token
       const float* qt = q + t * q_stride + size_t(h) * head_dim;
 
-      // 1. scores against every earlier token (s <= t): the causal mask is
-      //    simply not computing s > t at all.
-      for (int s = 0; s <= t; ++s) {
+      // 1. scores against every token up to and including this one (s <= p):
+      //    the causal mask is simply not computing s > p at all.
+      for (int s = 0; s <= p; ++s) {
         const float* ks = k + s * kv_stride + size_t(kvh) * head_dim;
         float dot = 0.0f;
         for (int d = 0; d < head_dim; ++d) dot += qt[d] * ks[d];
         scores[s] = dot * scale;
       }
       // 2. scores -> weights
-      softmax(scores.data(), t + 1);
+      softmax(scores.data(), p + 1);
 
       // 3. weighted sum of value vectors
       float* ot = out + t * q_stride + size_t(h) * head_dim;
       for (int d = 0; d < head_dim; ++d) ot[d] = 0.0f;
-      for (int s = 0; s <= t; ++s) {
+      for (int s = 0; s <= p; ++s) {
         const float* vs = v + s * kv_stride + size_t(kvh) * head_dim;
         const float w = scores[s];
         for (int d = 0; d < head_dim; ++d) ot[d] += w * vs[d];

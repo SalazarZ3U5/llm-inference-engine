@@ -5,8 +5,10 @@ It loads Hugging Face `safetensors` weights and generates text on an NVIDIA GPU.
 
 Target model: **Qwen2.5-0.5B-Instruct** (download needs no license approval). Development GPU: RTX 4060 (sm_89, 8 GB).
 
-> Status: **Phase 0 complete.** The CPU FP32 forward pass matches Hugging Face at every layer
-> (max relative error 9.5e-5) and predicts " Paris" for "The capital of France is". Next: Phase 1, generation.
+> Status: **Phase 1 complete.** Text generation and multi-turn chat on the CPU with a KV cache,
+> a from-scratch BPE tokenizer and sampling. Output matches Hugging Face at every layer, the tokenizer
+> matches on 155k+ test tokens, and greedy generation reproduces HF token for token.
+> Next: Phase 2, CPU performance.
 
 ## Layout
 
@@ -15,19 +17,26 @@ CMakeLists.txt          build (CUDA on by default; -DIE_ENABLE_CUDA=OFF for CPU-
 CMakePresets.json       release / debug / cpu-only presets (Ninja + MSVC)
 .clangd                 editor config so clangd understands .cu files
 src/
-  main.cpp              `ie` CLI: gpu-check, inspect, verify
+  main.cpp              `ie` CLI: generate, chat, tokenize, verify, test-tokenizer, inspect, gpu-check
   safetensors.{h,cpp}   weight-file reader (header parse + validation + lazy tensor reads)
   npy.{h,cpp}           .npy reader for reference activations + array comparison
   config.{h,cpp}        Config struct loaded from config.json
   weights.{h,cpp}       all weights as FP32, shape-checked against the config
   ops.{h,cpp}           CPU reference ops: linear, rmsnorm, rope, softmax, silu, attention
-  model.{h,cpp}         forward pass: embedding -> 24 layers -> final norm -> logits
+  model.{h,cpp}         forward pass with KV cache: embedding -> 24 layers -> final norm -> logits
+  tokenizer.{h,cpp}     byte-level BPE tokenizer (Qwen2 pre-split rules, special tokens, streaming decode)
+  unicode_tables.h      letter/number code-point ranges for the tokenizer (generated)
+  sampler.{h,cpp}       temperature, top-k, top-p, repetition penalty; defaults from generation_config.json
   cuda/
     cuda_check.cuh      CUDA_CHECK error macro
     device_check.cu     GPU info, vector-add test, memory-bandwidth test
 scripts/
   download_model.py     fetch weights + tokenizer into models/
   reference.py          dump ground-truth activations from HF transformers into reference/
+  make_tokenizer_cases.py   expected token ids from HF's tokenizer -> tests/tokenizer_cases.json
+  gen_unicode_tables.py     regenerate src/unicode_tables.h
+tests/
+  tokenizer_cases.json  347 strings (English, code, Hindi, Gujarati, CJK, emoji, random) + expected ids
 ```
 
 ## Setup (Windows)
@@ -71,7 +80,24 @@ build\release\ie.exe verify models\qwen2.5-0.5b-instruct reference\default
 ```
 
 Runs the prompt through the engine and compares every stage (embedding, each of the 24 layers,
-final norm, logits, next token) with the Hugging Face reference. Every row should say PASS.
+final norm, logits) with the Hugging Face reference, then checks the tokenizer and 20 tokens of greedy
+generation through the KV cache. Every row should say PASS.
+
+```
+build\release\ie.exe test-tokenizer models\qwen2.5-0.5b-instruct tests\tokenizer_cases.json
+```
+
+### 5. Generate text and chat
+
+```
+build\release\ie.exe generate models\qwen2.5-0.5b-instruct "Once upon a time"
+build\release\ie.exe generate models\qwen2.5-0.5b-instruct "Explain a KV cache in one sentence." --chat
+build\release\ie.exe chat models\qwen2.5-0.5b-instruct
+```
+
+Options: `--max-tokens N`, `--temp T`, `--top-k K`, `--top-p P`, `--rep R`, `--seed S`, `--greedy`,
+`--ctx N` (KV cache size), `--system "..."` (chat). Sampling defaults come from the model's
+`generation_config.json`. In chat, `/reset` starts a new conversation and `/exit` quits.
 
 ## Roadmap
 
@@ -87,12 +113,12 @@ final norm, logits, next token) with the Hugging Face reference. Every row shoul
 - [x] Final norm + LM head tied to `embed_tokens`
 - [x] `ie verify`: all 24 layers, final norm and logits within 1e-4 relative error; greedy next token = 12095 (" Paris")
 
-### Phase 1: generation
-- [ ] KV cache
-- [ ] Greedy decode reproduces `generated_ids.npy` exactly
-- [ ] Sampling: temperature, top-k, top-p
-- [ ] BPE tokenizer from `tokenizer.json`: encode matches `input_ids.npy`
-- [ ] Interactive chat CLI using the chat template
+### Phase 1: generation ✅
+- [x] KV cache (keys stored after RoPE); cached decode is bit-identical to a full recompute
+- [x] Greedy decode reproduces `generated_ids.npy` exactly (20/20 tokens)
+- [x] Sampling: temperature, top-k, top-p, repetition penalty (HF order and defaults)
+- [x] Byte-level BPE tokenizer: matches HF on 5,000+ strings / 155k tokens incl. Hindi, CJK, emoji, code
+- [x] `generate` and multi-turn `chat` with Qwen's ChatML template, streaming UTF-8 output
 
 ### Phase 2: CPU performance
 - [ ] Multithreaded matmul, SIMD (AVX2)
@@ -120,7 +146,7 @@ final norm, logits, next token) with the Hugging Face reference. Every row shoul
 
 | Date | Change | Decode tok/s | Prefill tok/s | Notes |
 |------|--------|-------------:|--------------:|-------|
-|      |        |              |               |       |
+| 2026-11-09 | Phase 1 baseline: CPU, FP32, single thread, plain loops | 2.84 | 4.0 | `chat`: 30-token prompt, 53 tokens generated |
 
 The decode speed limit is roughly memory bandwidth ÷ model size in bytes.
 `ie gpu-check` measures the bandwidth.

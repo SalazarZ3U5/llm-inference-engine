@@ -26,11 +26,13 @@ void softmax(float* x, int n);
 // SiLU (a.k.a. swish): x * sigmoid(x)
 float silu(float x);
 
-// Causal multi-head attention with grouped-query support.
-//   q: [T, n_heads * head_dim]   k, v: [T, n_kv_heads * head_dim]   out: [T, n_heads * head_dim]
+// Causal multi-head attention with grouped-query support, over a KV cache.
+//   q:    [T, n_heads * head_dim]          queries for T new tokens at positions pos0 .. pos0+T-1
+//   k, v: [pos0 + T, n_kv_heads * head_dim] keys/values for every token so far (cached ones first)
+//   out:  [T, n_heads * head_dim]
 //   Query head h reads key/value head h / (n_heads / n_kv_heads).
-//   Token t attends to tokens 0..t only.
-void attention(float* out, const float* q, const float* k, const float* v, int T, int n_heads,
-               int n_kv_heads, int head_dim);
+//   The new token at position p attends to positions 0..p only (causal).
+void attention(float* out, const float* q, const float* k, const float* v, int T, int pos0,
+               int n_heads, int n_kv_heads, int head_dim);
 
 }  // namespace ie
