@@ -5,7 +5,8 @@ It loads Hugging Face `safetensors` weights and generates text on an NVIDIA GPU.
 
 Target model: **Qwen2.5-0.5B-Instruct** (download needs no license approval). Development GPU: RTX 4060 (sm_89, 8 GB).
 
-> Status: Phase 0, setup. `ie gpu-check` and `ie inspect` work. The forward pass is next.
+> Status: **Phase 0 complete.** The CPU FP32 forward pass matches Hugging Face at every layer
+> (max relative error 9.5e-5) and predicts " Paris" for "The capital of France is". Next: Phase 1, generation.
 
 ## Layout
 
@@ -14,8 +15,13 @@ CMakeLists.txt          build (CUDA on by default; -DIE_ENABLE_CUDA=OFF for CPU-
 CMakePresets.json       release / debug / cpu-only presets (Ninja + MSVC)
 .clangd                 editor config so clangd understands .cu files
 src/
-  main.cpp              `ie` CLI
+  main.cpp              `ie` CLI: gpu-check, inspect, verify
   safetensors.{h,cpp}   weight-file reader (header parse + validation + lazy tensor reads)
+  npy.{h,cpp}           .npy reader for reference activations + array comparison
+  config.{h,cpp}        Config struct loaded from config.json
+  weights.{h,cpp}       all weights as FP32, shape-checked against the config
+  ops.{h,cpp}           CPU reference ops: linear, rmsnorm, rope, softmax, silu, attention
+  model.{h,cpp}         forward pass: embedding -> 24 layers -> final norm -> logits
   cuda/
     cuda_check.cuh      CUDA_CHECK error macro
     device_check.cu     GPU info, vector-add test, memory-bandwidth test
@@ -58,19 +64,28 @@ python scripts\reference.py
 build\release\ie.exe inspect models\qwen2.5-0.5b-instruct\model.safetensors
 ```
 
+### 4. Check the forward pass against the reference
+
+```
+build\release\ie.exe verify models\qwen2.5-0.5b-instruct reference\default
+```
+
+Runs the prompt through the engine and compares every stage (embedding, each of the 24 layers,
+final norm, logits, next token) with the Hugging Face reference. Every row should say PASS.
+
 ## Roadmap
 
-### Phase 0: correct forward pass (CPU, FP32)
-- [ ] Load config.json (hidden size, heads, KV heads, layers, eps, rope theta)
-- [ ] Load weights; convert BF16 to FP32 (BF16 is the top 16 bits of an FP32)
-- [ ] Embedding lookup: compare with `reference/default/embed.npy`
-- [ ] RMSNorm
-- [ ] Q/K/V projections. **Qwen2 has biases on q/k/v**; Llama does not
-- [ ] RoPE (rotate-half variant as used by HF; theta from config)
-- [ ] Grouped-query attention with causal mask (several Q heads share each K/V head)
-- [ ] SwiGLU MLP: `down(silu(gate(x)) * up(x))`
-- [ ] Final norm + LM head (**weights tied to `embed_tokens`**: there may be no separate `lm_head.weight`)
-- [ ] Each `layer_XX.npy` matches to about 1e-4; `logits.npy` argmax matches
+### Phase 0: correct forward pass (CPU, FP32) ✅
+- [x] Load config.json (hidden size, heads, KV heads, layers, eps, rope theta)
+- [x] Load weights; convert BF16 to FP32 (BF16 is the top 16 bits of an FP32)
+- [x] Embedding lookup: matches `reference/default/embed.npy` exactly
+- [x] RMSNorm
+- [x] Q/K/V projections with Qwen2's q/k/v biases (optional, so Llama-style models also load)
+- [x] RoPE (rotate-half variant as used by HF; theta from config)
+- [x] Grouped-query attention with causal mask (7 query heads share each K/V head)
+- [x] SwiGLU MLP: `down(silu(gate(x)) * up(x))`
+- [x] Final norm + LM head tied to `embed_tokens`
+- [x] `ie verify`: all 24 layers, final norm and logits within 1e-4 relative error; greedy next token = 12095 (" Paris")
 
 ### Phase 1: generation
 - [ ] KV cache

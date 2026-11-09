@@ -34,6 +34,11 @@ add_library(nlohmann_json::nlohmann_json ALIAS nlohmann_json)
 # --- engine library ---------------------------------------------------------
 add_library(ie_core
   src/safetensors.cpp
+  src/npy.cpp
+  src/config.cpp
+  src/weights.cpp
+  src/ops.cpp
+  src/model.cpp
 )
 target_include_directories(ie_core PUBLIC src)
 target_link_libraries(ie_core PUBLIC nlohmann_json::nlohmann_json)
