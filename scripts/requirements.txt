@@ -1,0 +1,7 @@
+# Reference tooling only - the engine itself never uses these.
+# CPU-only PyTorch is enough (install it first, see README):
+#   pip install torch --index-url https://download.pytorch.org/whl/cpu
+transformers
+safetensors
+numpy
+huggingface_hub

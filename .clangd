@@ -1,0 +1,27 @@
+# clangd config for C++ + CUDA (nvcc) projects.
+# compile_commands.json comes from the CMake preset's build folder.
+CompileFlags:
+  CompilationDatabase: build/release
+  Remove:
+    - -forward-unknown-to-host-compiler
+    - --generate-code*
+    - -gencode*
+    - -arch=*
+    - -rdc=*
+    - -Xcompiler*
+    - -Xcudafe*
+    - --expt-*
+    - --options-file
+    - -lineinfo
+---
+If:
+  PathMatch: .*\.(cu|cuh)
+CompileFlags:
+  Add:
+    - -xcuda
+    - --cuda-gpu-arch=sm_89
+    - --no-cuda-version-check
+Diagnostics:
+  Suppress:
+    - drv_unknown_argument
+    - drv_unsupported_opt

@@ -1,0 +1,11 @@
+build/
+models/
+reference/
+.cache/
+.vscode/
+.vs/
+*.nsys-rep
+*.ncu-rep
+__pycache__/
+refenv/
+.venv/
