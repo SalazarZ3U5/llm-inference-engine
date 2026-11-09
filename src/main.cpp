@@ -6,8 +6,13 @@
 //   ie verify   <model_dir> <ref_dir>              check every stage + generation against reference
 //   ie test-tokenizer <model_dir> <cases.json>     check the tokenizer against Hugging Face's
 //   ie inspect  <model.safetensors>                list every tensor in a weights file
+//   ie bench    <model_dir> [--sweep]              measure prefill and decode speed
+//   ie perplexity <model_dir> <text_file>          measure model quality on a text
+//   ie test-kernels                                check the fast matmul kernels against the reference
 //   ie gpu-check                                   GPU info + vector-add test + bandwidth test
 //
+// Performance options: --weights f32|bf16|int8 (default bf16)  --threads N (default: physical cores)
+//                      --kernel scalar|avx2 (default: avx2 if compiled in)
 // Sampling options: --temp T  --top-k K  --top-p P  --rep R  --seed S  --greedy
 //   (defaults come from the model's generation_config.json)
 // Other options:    --max-tokens N (default 256)  --ctx N (KV cache size, default 4096)
@@ -23,16 +28,21 @@
 #include <iostream>
 #include <memory>
 #include <optional>
+#include <random>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include <nlohmann/json.hpp>
 
 #include "config.h"
+#include "matrix.h"
 #include "model.h"
 #include "npy.h"
 #include "safetensors.h"
+#include "ops.h"
 #include "sampler.h"
+#include "threadpool.h"
 #include "tokenizer.h"
 #include "weights.h"
 
@@ -66,9 +76,13 @@ void usage() {
       "  ie verify   <model_dir> <reference_dir>\n"
       "  ie test-tokenizer <model_dir> <cases.json>\n"
       "  ie inspect  <model.safetensors>\n"
+      "  ie bench    <model_dir> [--sweep] [--prompt-tokens N] [--gen-tokens N]\n"
+      "  ie perplexity <model_dir> <text_file>\n"
+      "  ie test-kernels\n"
       "  ie gpu-check\n"
       "\n"
-      "options: --max-tokens N  --ctx N  --temp T  --top-k K  --top-p P  --rep R  --seed S  --greedy\n");
+      "options: --max-tokens N  --ctx N  --temp T  --top-k K  --top-p P  --rep R  --seed S  --greedy\n"
+      "         --weights f32|bf16|int8  --threads N  --kernel scalar|avx2\n");
 }
 
 double seconds_since(Clock::time_point t0) {
@@ -140,6 +154,12 @@ struct Options {
   int ctx = 4096;
   bool chat = false;
   std::string system = kDefaultSystem;
+  // Performance
+  std::string weights = "bf16";
+  int threads = 0;           // 0 = one per physical core
+  std::string kernel;        // empty = default
+  int prompt_tokens = 64, gen_tokens = 32;
+  bool sweep = false;
 };
 
 Options parse_options(const std::vector<std::string>& args, size_t first) {
@@ -160,6 +180,12 @@ Options parse_options(const std::vector<std::string>& args, size_t first) {
     else if (a == "--ctx") o.ctx = std::stoi(next());
     else if (a == "--chat") o.chat = true;
     else if (a == "--system") o.system = next();
+    else if (a == "--weights") o.weights = next();
+    else if (a == "--threads") o.threads = std::stoi(next());
+    else if (a == "--kernel") o.kernel = next();
+    else if (a == "--prompt-tokens") o.prompt_tokens = std::stoi(next());
+    else if (a == "--gen-tokens") o.gen_tokens = std::stoi(next());
+    else if (a == "--sweep") o.sweep = true;
     else if (a.rfind("--", 0) == 0) throw std::runtime_error("unknown option " + a);
     else o.positional.push_back(a);
   }
@@ -183,14 +209,29 @@ ie::SamplingParams sampling_for(const Options& o, const std::string& model_dir) 
 
 // ----------------------------------------------------------- loading ----
 
-std::unique_ptr<ie::Model> load_model(const fs::path& model_dir) {
+int hardware_threads() { return int(std::max(1u, std::thread::hardware_concurrency())); }
+
+// Applies --threads and --kernel to the global compute settings.
+void apply_compute_options(const Options& o) {
+  ie::set_num_threads(o.threads);  // <= 0: one per physical core
+  if (!o.kernel.empty()) ie::set_kernel(ie::parse_kernel(o.kernel));
+}
+
+std::unique_ptr<ie::Model> load_model(const fs::path& model_dir, ie::DType dtype) {
   auto t0 = Clock::now();
   ie::Config cfg = ie::load_config((model_dir / "config.json").string());
   ie::SafeTensorsFile st((model_dir / "model.safetensors").string());
-  auto model = std::make_unique<ie::Model>(cfg, ie::load_weights(st, cfg));
-  std::fprintf(stderr, "[loaded %.1fM parameters in %.1f s]\n",
-               model->weights().num_params() / 1e6, seconds_since(t0));
+  auto model = std::make_unique<ie::Model>(cfg, ie::load_weights(st, cfg, dtype));
+  std::fprintf(stderr, "[loaded %.1fM parameters as %s (%.0f MiB) in %.1f s | %d threads | %s kernels]\n",
+               model->weights().num_params() / 1e6, ie::dtype_name(dtype),
+               model->weights().matrix_bytes() / 1048576.0, seconds_since(t0),
+               ie::thread_pool().num_threads(), ie::kernel_name(ie::current_kernel()));
   return model;
+}
+
+std::unique_ptr<ie::Model> load_model(const fs::path& model_dir, const Options& o) {
+  apply_compute_options(o);
+  return load_model(model_dir, ie::parse_dtype(o.weights));
 }
 
 // --------------------------------------------------------- generation ----
@@ -259,7 +300,7 @@ std::string chat_turn(const std::string& system, const std::string& user, bool f
 int cmd_generate(const Options& o) {
   if (o.positional.size() < 2) { usage(); return 1; }
   const fs::path model_dir = o.positional[0];
-  auto model = load_model(model_dir);
+  auto model = load_model(model_dir, o);
   ie::Tokenizer tok(model_dir.string());
   ie::Sampler sampler(sampling_for(o, model_dir.string()));
 
@@ -280,7 +321,7 @@ int cmd_generate(const Options& o) {
 int cmd_chat(const Options& o) {
   if (o.positional.empty()) { usage(); return 1; }
   const fs::path model_dir = o.positional[0];
-  auto model = load_model(model_dir);
+  auto model = load_model(model_dir, o);
   ie::Tokenizer tok(model_dir.string());
   ie::Sampler sampler(sampling_for(o, model_dir.string()));
   ie::KVCache cache = model->make_cache(o.ctx);
@@ -387,6 +428,192 @@ int cmd_test_tokenizer(const Options& o) {
   return failures ? 1 : 0;
 }
 
+// -------------------------------------------------------------- bench ----
+
+const char* kBenchText =
+    "The history of computing is a story of making machines do more work with less effort. Early "
+    "calculators were mechanical, built from gears and levers, and every answer had to be read off "
+    "a dial by hand. Electronic computers replaced the gears with vacuum tubes, then with "
+    "transistors, and finally with integrated circuits holding billions of switches. ";
+
+struct BenchResult {
+  double prefill_tps = 0, decode_tps = 0, gbps = 0;
+};
+
+// Prefill `prompt_tokens` tokens in one call, then decode `gen_tokens` tokens
+// one at a time (greedy, no sampling cost), with the current thread/kernel settings.
+BenchResult run_bench(const ie::Model& model, const ie::Tokenizer& tok, int prompt_tokens,
+                      int gen_tokens) {
+  std::vector<int32_t> unit = tok.encode(kBenchText), prompt;
+  while (int(prompt.size()) < prompt_tokens) prompt.insert(prompt.end(), unit.begin(), unit.end());
+  prompt.resize(prompt_tokens);
+  const int V = model.config().vocab_size;
+
+  {  // warm-up: wake the threads, fault in memory
+    ie::KVCache warm = model.make_cache(8);
+    model.forward({prompt.begin(), prompt.begin() + 4}, warm);
+  }
+  ie::KVCache cache = model.make_cache(prompt_tokens + gen_tokens);
+  auto t0 = Clock::now();
+  std::vector<float> logits = model.forward(prompt, cache);
+  const double prefill_s = seconds_since(t0);
+  auto t1 = Clock::now();
+  for (int i = 0; i < gen_tokens; ++i) logits = model.forward({ie::argmax(logits.data(), V)}, cache);
+  const double decode_s = seconds_since(t1);
+
+  BenchResult r;
+  r.prefill_tps = prompt_tokens / prefill_s;
+  r.decode_tps = gen_tokens / decode_s;
+  // Each decode step streams every weight matrix once (the tied embedding is
+  // read in full as the LM head), so this is the memory bandwidth achieved.
+  r.gbps = r.decode_tps * double(model.weights().matrix_bytes()) / 1e9;
+  return r;
+}
+
+int cmd_bench(const Options& o) {
+  if (o.positional.empty()) { usage(); return 1; }
+  const fs::path model_dir = o.positional[0];
+  ie::Tokenizer tok(model_dir.string());
+
+  struct Cfg { std::string weights; ie::Kernel kernel; int threads; };
+  std::vector<Cfg> cfgs;
+  const int all = hardware_threads(), cores = ie::physical_cores();
+  const ie::Kernel fast = ie::avx2_available() ? ie::Kernel::Avx2 : ie::Kernel::Scalar;
+  if (o.sweep) {
+    // The Phase 2 story, one step at a time.
+    cfgs = {{"f32", ie::Kernel::Scalar, 1}, {"f32", fast, 1},  {"f32", fast, cores},
+            {"f32", fast, all},              {"bf16", fast, cores}, {"bf16", fast, all},
+            {"int8", fast, cores},            {"int8", fast, all}};
+  } else {
+    cfgs = {{o.weights, o.kernel.empty() ? ie::current_kernel() : ie::parse_kernel(o.kernel),
+             o.threads > 0 ? o.threads : cores}};
+  }
+  // On machines with few threads some sweep entries coincide; run each once.
+  cfgs.erase(std::unique(cfgs.begin(), cfgs.end(),
+                         [](const Cfg& a, const Cfg& b) {
+                           return a.weights == b.weights && a.kernel == b.kernel &&
+                                  a.threads == b.threads;
+                         }),
+             cfgs.end());
+
+  std::printf("prompt %d tokens, generate %d tokens, %d physical cores, %d hardware threads\n\n",
+              o.prompt_tokens, o.gen_tokens, cores, all);
+  std::printf("| Weights | Kernel | Threads | Prefill tok/s | Decode tok/s | Decode GB/s |\n");
+  std::printf("|---------|--------|--------:|--------------:|-------------:|------------:|\n");
+  std::unique_ptr<ie::Model> model;
+  std::string loaded;
+  for (const Cfg& c : cfgs) {
+    ie::set_num_threads(c.threads);
+    ie::set_kernel(c.kernel);
+    if (loaded != c.weights) {
+      model.reset();  // free the previous copy first
+      model = load_model(model_dir, ie::parse_dtype(c.weights));
+      loaded = c.weights;
+    }
+    BenchResult r = run_bench(*model, tok, o.prompt_tokens, o.gen_tokens);
+    std::printf("| %s | %s | %d | %.1f | %.1f | %.1f |\n", c.weights.c_str(),
+                ie::kernel_name(c.kernel), c.threads, r.prefill_tps, r.decode_tps, r.gbps);
+    std::fflush(stdout);
+  }
+  return 0;
+}
+
+// --------------------------------------------------------- perplexity ----
+
+// Perplexity = exp(average negative log-likelihood of each next token).
+// Lower is better; it is the standard way to check that a faster or smaller
+// version of a model (e.g. INT8) still predicts text as well as the original.
+int cmd_perplexity(const Options& o) {
+  if (o.positional.size() < 2) { usage(); return 1; }
+  const fs::path model_dir = o.positional[0];
+  auto model = load_model(model_dir, o);
+  ie::Tokenizer tok(model_dir.string());
+  std::ifstream f(fs::path(o.positional[1]), std::ios::binary);
+  if (!f) throw std::runtime_error("cannot open " + o.positional[1]);
+  const std::string text((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+
+  std::vector<int32_t> ids = tok.encode(text, /*allow_special=*/false);
+  if (int(ids.size()) > o.ctx) ids.resize(o.ctx);
+  if (ids.size() < 2) throw std::runtime_error("text too short");
+  const int V = model->config().vocab_size, chunk = 128;
+
+  // Feed the text in chunks through the KV cache; logits at position i score token i+1.
+  ie::KVCache cache = model->make_cache(int(ids.size()));
+  double nll = 0;
+  int scored = 0;
+  auto t0 = Clock::now();
+  for (size_t start = 0; start < ids.size(); start += chunk) {
+    const size_t end = std::min(ids.size(), start + chunk);
+    std::vector<int32_t> part(ids.begin() + start, ids.begin() + end);
+    std::vector<float> logits = model->forward(part, cache, /*all_logits=*/true);
+    for (size_t i = start; i < end && i + 1 < ids.size(); ++i) {
+      const float* row = logits.data() + (i - start) * size_t(V);
+      double mx = row[0];
+      for (int v = 1; v < V; ++v) mx = std::max(mx, double(row[v]));
+      double sum = 0;
+      for (int v = 0; v < V; ++v) sum += std::exp(double(row[v]) - mx);
+      nll += (mx + std::log(sum)) - double(row[ids[i + 1]]);  // -log softmax(row)[target]
+      ++scored;
+    }
+  }
+  const double s = seconds_since(t0);
+  std::printf("%s weights: perplexity %.4f over %d tokens (%.1f s, %.1f tok/s)\n",
+              ie::dtype_name(model->weights().dtype), std::exp(nll / scored), scored, s,
+              ids.size() / s);
+  return 0;
+}
+
+// ------------------------------------------------------- test-kernels ----
+
+// Checks every matmul kernel (each weight type x scalar/AVX2 x thread count x
+// token count) against the plain reference `ie::linear` on random data.
+int cmd_test_kernels(const Options&) {
+  std::mt19937 rng(1234);
+  std::uniform_real_distribution<float> uni(-1.0f, 1.0f);
+  struct Shape { int rows, cols; };
+  const Shape shapes[] = {{37, 75}, {128, 896}, {64, 4864}};
+  const int token_counts[] = {1, 2, 3, 4, 5, 9};
+  std::vector<ie::Kernel> kernels = {ie::Kernel::Scalar};
+  if (ie::avx2_available()) kernels.push_back(ie::Kernel::Avx2);
+
+  int failures = 0, tests = 0;
+  double worst = 0;
+  for (const Shape& sh : shapes) {
+    std::vector<float> w(size_t(sh.rows) * sh.cols), bias(sh.rows);
+    for (float& x : w) x = 0.1f * uni(rng);
+    for (float& x : bias) x = uni(rng);
+    for (ie::DType dt : {ie::DType::F32, ie::DType::BF16, ie::DType::I8}) {
+      ie::Matrix m = ie::make_matrix(w, sh.rows, sh.cols, dt);
+      std::vector<float> deq(w.size());  // the exact values the kernel should be using
+      for (int r = 0; r < sh.rows; ++r) m.row_to_f32(r, &deq[size_t(r) * sh.cols]);
+      for (int T : token_counts) {
+        std::vector<float> x(size_t(T) * sh.cols), want(size_t(T) * sh.rows), got(want.size());
+        for (float& v : x) v = uni(rng);
+        ie::linear(want.data(), x.data(), deq.data(), bias.data(), T, sh.cols, sh.rows);
+        for (ie::Kernel k : kernels) {
+          for (int threads : {1, 3}) {
+            ie::set_kernel(k);
+            ie::set_num_threads(threads);
+            std::fill(got.begin(), got.end(), 0.0f);
+            ie::matmul(got.data(), x.data(), m, bias.data(), T);
+            ie::CompareResult r = ie::compare(got.data(), want.data(), want.size());
+            ++tests;
+            worst = std::max(worst, r.rel_err);
+            if (r.rel_err > 1e-5) {
+              ++failures;
+              std::printf("FAIL %s %s threads=%d T=%d %dx%d: rel_err %.2e\n", ie::dtype_name(dt),
+                          ie::kernel_name(k), threads, T, sh.rows, sh.cols, r.rel_err);
+            }
+          }
+        }
+      }
+    }
+  }
+  std::printf("%s: %d kernel tests, %d failed (worst relative error %.2e)\n",
+              failures ? "FAILED" : "ALL PASSED", tests, failures, worst);
+  return failures ? 1 : 0;
+}
+
 // ------------------------------------------------------------- verify ----
 
 // Error budget per stage. The embedding is a pure copy of converted weights,
@@ -404,7 +631,7 @@ double tolerance(const std::string& stage) { return stage == "embed" ? 0.0 : 1e-
 int cmd_verify(const Options& o) {
   if (o.positional.size() < 2) { usage(); return 1; }
   const fs::path model_dir = o.positional[0], ref_dir = o.positional[1];
-  auto model = load_model(model_dir);
+  auto model = load_model(model_dir, o);
   const ie::Config& cfg = model->config();
   ie::Tokenizer tok(model_dir.string());
 
@@ -412,11 +639,21 @@ int cmd_verify(const Options& o) {
   std::vector<int32_t> ids;
   for (int64_t id : ids_npy.i64) ids.push_back(static_cast<int32_t>(id));
 
+  // INT8 weights are an approximation, so their numbers can't match the
+  // reference to 1e-3. Show the errors for information, and judge quality
+  // with `ie perplexity` instead.
+  const bool lossy = model->weights().dtype == ie::DType::I8;
+  if (lossy)
+    std::printf("\nINT8 weights are approximate: model errors below are shown for information only.\n"
+                "Use `ie perplexity` to measure INT8 quality.\n");
+
   int failures = 0, checked = 0;
-  auto report = [&](const char* name, bool ok, const std::string& detail) {
-    ++checked;
-    if (!ok) ++failures;
-    std::printf("%-12s %-44s %s\n", name, detail.c_str(), ok ? "PASS" : "FAIL");
+  auto report = [&](const char* name, bool ok, const std::string& detail, bool info = false) {
+    if (!info) {
+      ++checked;
+      if (!ok) ++failures;
+    }
+    std::printf("%-12s %-44s %s\n", name, detail.c_str(), info ? "(info)" : ok ? "PASS" : "FAIL");
   };
 
   // --- 1. every stage of one full forward pass ---
@@ -435,6 +672,12 @@ int cmd_verify(const Options& o) {
     }
     ie::CompareResult r = ie::compare(data, ref.f32.data(), ref.size());
     bool ok = r.rel_err <= tolerance(stage);
+    if (lossy) {
+      --checked;
+      std::printf("%-12s %14.3e %14.3e %12.3e  (info)\n", stage.c_str(), r.max_abs_err,
+                  r.max_abs_ref, r.rel_err);
+      return;
+    }
     if (!ok) ++failures;
     std::printf("%-12s %14.3e %14.3e %12.3e  %s", stage.c_str(), r.max_abs_err, r.max_abs_ref,
                 r.rel_err, ok ? "PASS" : "FAIL");
@@ -488,7 +731,7 @@ int cmd_verify(const Options& o) {
     else
       std::snprintf(detail, sizeof(detail), "first mismatch at token %zu: %d vs %d", first_bad,
                     got[first_bad], want[first_bad]);
-    report("generate", first_bad == want.size(), detail);
+    report("generate", first_bad == want.size(), detail, lossy);
     std::printf("             \"%s\"\n", tok.decode(got).c_str());
   }
 
@@ -546,6 +789,9 @@ int main(int argc, char** argv) {
     if (cmd == "verify") return cmd_verify(o);
     if (cmd == "test-tokenizer") return cmd_test_tokenizer(o);
     if (cmd == "inspect") return cmd_inspect(o);
+    if (cmd == "bench") return cmd_bench(o);
+    if (cmd == "perplexity") return cmd_perplexity(o);
+    if (cmd == "test-kernels") return cmd_test_kernels(o);
   } catch (const std::exception& e) {
     std::fprintf(stderr, "error: %s\n", e.what());
     return 1;

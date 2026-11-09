@@ -1,5 +1,8 @@
 #pragma once
-// All model weights, converted to FP32 and held in CPU memory.
+// All model weights, held in CPU memory.
+//
+// The big matrices are `Matrix` objects stored as F32, BF16 or INT8 (see
+// matrix.h). Small vectors (norm weights, biases) are always FP32.
 //
 // Every matrix is stored the way PyTorch's nn.Linear stores it: [out, in],
 // row-major. So W[o * in + i] is the weight from input i to output o, and
@@ -10,31 +13,32 @@
 #include <vector>
 
 #include "config.h"
+#include "matrix.h"
 #include "safetensors.h"
 
 namespace ie {
 
 struct LayerWeights {
   std::vector<float> input_norm;      // [hidden]            RMSNorm before attention
-  std::vector<float> wq, bq;          // [q_dim, hidden], [q_dim]
-  std::vector<float> wk, bk;          // [kv_dim, hidden], [kv_dim]
-  std::vector<float> wv, bv;          // [kv_dim, hidden], [kv_dim]
-  std::vector<float> wo;              // [hidden, q_dim]     no bias
+  Matrix wq, wk, wv;                  // [q_dim, hidden], [kv_dim, hidden] x2
+  std::vector<float> bq, bk, bv;      // [q_dim], [kv_dim] x2; empty if the model has none
+  Matrix wo;                          // [hidden, q_dim]     no bias
   std::vector<float> post_attn_norm;  // [hidden]            RMSNorm before the MLP
-  std::vector<float> w_gate, w_up;    // [intermediate, hidden]
-  std::vector<float> w_down;          // [hidden, intermediate]
-  // Biases are empty for models that have none (e.g. Llama).
+  Matrix w_gate, w_up;                // [intermediate, hidden]
+  Matrix w_down;                      // [hidden, intermediate]
 };
 
 struct Weights {
-  std::vector<float> embed;           // [vocab, hidden]
+  DType dtype = DType::BF16;          // storage format of the matrices
+  Matrix embed;                       // [vocab, hidden]
   std::vector<LayerWeights> layers;
   std::vector<float> final_norm;      // [hidden]
-  std::vector<float> lm_head;         // [vocab, hidden]; empty when tied to embed
+  Matrix lm_head;                     // [vocab, hidden]; empty when tied to embed
 
   // The matrix used to turn the final hidden state into logits.
-  const float* lm_head_ptr() const { return lm_head.empty() ? embed.data() : lm_head.data(); }
+  const Matrix& lm_head_matrix() const { return lm_head.rows ? lm_head : embed; }
   size_t num_params() const;
+  size_t matrix_bytes() const;        // bytes of all matrices (what decode streams)
 };
 
 // BF16 is the upper 16 bits of an IEEE FP32, so conversion is a shift.
@@ -46,7 +50,8 @@ inline float bf16_to_f32(uint16_t h) {
   return f;
 }
 
-// Loads every tensor the config calls for, checks its shape, converts to FP32.
-Weights load_weights(const SafeTensorsFile& file, const Config& cfg);
+// Loads every tensor the config calls for, checks its shape, and stores the
+// matrices as `dtype`.
+Weights load_weights(const SafeTensorsFile& file, const Config& cfg, DType dtype = DType::BF16);
 
 }  // namespace ie

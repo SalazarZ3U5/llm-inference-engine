@@ -1,6 +1,7 @@
 cmake_minimum_required(VERSION 3.24)
 
 option(IE_ENABLE_CUDA "Build the CUDA backend" ON)
+option(IE_AVX2 "Build the AVX2/FMA CPU kernels (any x86 CPU from ~2013 on)" ON)
 
 if(IE_ENABLE_CUDA)
   # RTX 4060 = Ada Lovelace = compute capability 8.9. Override with -DCMAKE_CUDA_ARCHITECTURES=...
@@ -41,9 +42,20 @@ add_library(ie_core
   src/model.cpp
   src/tokenizer.cpp
   src/sampler.cpp
+  src/threadpool.cpp
+  src/matrix.cpp
 )
 target_include_directories(ie_core PUBLIC src)
-target_link_libraries(ie_core PUBLIC nlohmann_json::nlohmann_json)
+find_package(Threads REQUIRED)
+target_link_libraries(ie_core PUBLIC nlohmann_json::nlohmann_json Threads::Threads)
+
+if(IE_AVX2)
+  if(MSVC)
+    target_compile_options(ie_core PUBLIC $<$<COMPILE_LANGUAGE:CXX>:/arch:AVX2>)
+  else()
+    target_compile_options(ie_core PUBLIC $<$<COMPILE_LANGUAGE:CXX>:-mavx2 -mfma>)
+  endif()
+endif()
 
 if(IE_ENABLE_CUDA)
   target_sources(ie_core PRIVATE src/cuda/device_check.cu)

@@ -5,10 +5,9 @@ It loads Hugging Face `safetensors` weights and generates text on an NVIDIA GPU.
 
 Target model: **Qwen2.5-0.5B-Instruct** (download needs no license approval). Development GPU: RTX 4060 (sm_89, 8 GB).
 
-> Status: **Phase 1 complete.** Text generation and multi-turn chat on the CPU with a KV cache,
-> a from-scratch BPE tokenizer and sampling. Output matches Hugging Face at every layer, the tokenizer
-> matches on 155k+ test tokens, and greedy generation reproduces HF token for token.
-> Next: Phase 2, CPU performance.
+> Status: **Phase 2 complete.** Fast CPU inference: a custom thread pool, cache-blocked AVX2/FMA
+> matmul kernels, and BF16 or INT8 weights. BF16 still matches Hugging Face at every layer; INT8 halves
+> memory traffic again for a 0.5% perplexity cost. Next: Phase 3, CUDA.
 
 ## Layout
 
@@ -27,6 +26,8 @@ src/
   tokenizer.{h,cpp}     byte-level BPE tokenizer (Qwen2 pre-split rules, special tokens, streaming decode)
   unicode_tables.h      letter/number code-point ranges for the tokenizer (generated)
   sampler.{h,cpp}       temperature, top-k, top-p, repetition penalty; defaults from generation_config.json
+  matrix.{h,cpp}        weight matrices as f32 / bf16 / int8; blocked matmul with scalar and AVX2 kernels
+  threadpool.{h,cpp}    fixed thread pool for parallel loops (spins briefly, then sleeps)
   cuda/
     cuda_check.cuh      CUDA_CHECK error macro
     device_check.cu     GPU info, vector-add test, memory-bandwidth test
@@ -37,6 +38,7 @@ scripts/
   gen_unicode_tables.py     regenerate src/unicode_tables.h
 tests/
   tokenizer_cases.json  347 strings (English, code, Hindi, Gujarati, CJK, emoji, random) + expected ids
+  perplexity.txt        fixed ~700-token text for measuring model quality
 ```
 
 ## Setup (Windows)
@@ -99,6 +101,22 @@ Options: `--max-tokens N`, `--temp T`, `--top-k K`, `--top-p P`, `--rep R`, `--s
 `--ctx N` (KV cache size), `--system "..."` (chat). Sampling defaults come from the model's
 `generation_config.json`. In chat, `/reset` starts a new conversation and `/exit` quits.
 
+Performance options for every command that runs the model: `--weights f32|bf16|int8` (default `bf16`),
+`--threads N` (default: one per physical core), `--kernel scalar|avx2` (default `avx2`).
+
+### 6. Measure speed and quality
+
+```
+build\release\ie.exe bench models\qwen2.5-0.5b-instruct --sweep
+build\release\ie.exe perplexity models\qwen2.5-0.5b-instruct tests\perplexity.txt --weights int8
+build\release\ie.exe test-kernels
+```
+
+`bench --sweep` walks through every optimization step (scalar → AVX2 → threads → BF16 → INT8) and
+prints a table of prefill and decode speed. `perplexity` scores how well the model predicts a fixed
+text (lower is better), which is how INT8 is checked against BF16. `test-kernels` checks every matmul
+kernel against the plain reference implementation.
+
 ## Roadmap
 
 ### Phase 0: correct forward pass (CPU, FP32) ✅
@@ -120,10 +138,13 @@ Options: `--max-tokens N`, `--temp T`, `--top-k K`, `--top-p P`, `--rep R`, `--s
 - [x] Byte-level BPE tokenizer: matches HF on 5,000+ strings / 155k tokens incl. Hindi, CJK, emoji, code
 - [x] `generate` and multi-turn `chat` with Qwen's ChatML template, streaming UTF-8 output
 
-### Phase 2: CPU performance
-- [ ] Multithreaded matmul, SIMD (AVX2)
-- [ ] INT8 weight quantization
-- [ ] Benchmark harness: prefill tok/s, decode tok/s, time to first token
+### Phase 2: CPU performance ✅
+- [x] Benchmark harness (`ie bench`): prefill tok/s, decode tok/s, achieved memory bandwidth
+- [x] Thread pool; matmul split across output rows, attention across heads
+- [x] Cache blocking: 16 weight rows x 4 tokens, so each weight is read once per call during prefill
+- [x] AVX2 + FMA kernels for f32, bf16 and int8 weights (216 kernel tests against the reference)
+- [x] BF16 weight storage: half the memory traffic, still exact; `ie verify` passes
+- [x] INT8 per-row quantization: perplexity 14.85 vs 14.78 for BF16 (+0.5%), same greedy output
 
 ### Phase 3: CUDA
 - [ ] Weights resident on GPU in FP16/BF16
@@ -147,6 +168,30 @@ Options: `--max-tokens N`, `--temp T`, `--top-k K`, `--top-p P`, `--rep R`, `--s
 | Date | Change | Decode tok/s | Prefill tok/s | Notes |
 |------|--------|-------------:|--------------:|-------|
 | 2026-11-09 | Phase 1 baseline: CPU, FP32, single thread, plain loops | 2.84 | 4.0 | `chat`: 30-token prompt, 53 tokens generated |
+| 2026-11-10 | Cache-blocked matmul (16 rows x 4 tokens), scalar, 1 thread | 2.7 | 14.2 | prefill 3.5x from weight reuse alone |
+| 2026-11-10 | AVX2 + FMA kernels, 1 thread | 11.1 | 70.6 | 8 multiply-adds per instruction |
+| 2026-11-10 | Thread pool, 6 threads (one per physical core) | 17.0 | 184.7 | decode now limited by RAM bandwidth (33.6 GB/s) |
+| 2026-11-10 | BF16 weight storage, 6 threads | 31.5 | 207.2 | half the bytes per token, still exact |
+| 2026-11-10 | INT8 weights (per-row scales), 6 threads | **59.8** | 222.9 | quarter of FP32's bytes; perplexity +0.5% |
+
+Full sweep (`ie bench --sweep`, 64-token prompt, 32 generated tokens) on a Ryzen 5 3600XT
+(6 cores / 12 threads, AVX2) with dual-channel DDR4:
+
+| Weights | Kernel | Threads | Prefill tok/s | Decode tok/s | Decode GB/s |
+|---------|--------|--------:|--------------:|-------------:|------------:|
+| f32 | scalar | 1 | 14.2 | 2.7 | 5.4 |
+| f32 | avx2 | 1 | 70.6 | 11.1 | 21.9 |
+| f32 | avx2 | 6 | 184.7 | 17.0 | 33.6 |
+| f32 | avx2 | 12 | 236.1 | 11.5 | 22.8 |
+| bf16 | avx2 | 6 | 207.2 | 31.5 | 31.1 |
+| bf16 | avx2 | 12 | 279.7 | 18.4 | 18.1 |
+| int8 | avx2 | 6 | 222.9 | 59.8 | 29.7 |
+| int8 | avx2 | 12 | 256.3 | 25.2 | 12.5 |
+
+Using all 12 hardware threads helps prefill (large, compute-bound calls) but cuts decode by up to 58%.
+Decode makes ~200 small parallel calls per token and each waits for its slowest thread; with every
+hyper-thread busy, the OS has to pause one of them now and then, and every call waits for it. The engine
+therefore defaults to one thread per physical core.
 
 The decode speed limit is roughly memory bandwidth ÷ model size in bytes.
 `ie gpu-check` measures the bandwidth.

@@ -4,6 +4,7 @@
 #include <cstring>
 #include <stdexcept>
 
+#include "matrix.h"
 #include "ops.h"
 
 namespace ie {
@@ -48,10 +49,10 @@ std::vector<float> Model::forward(const std::vector<int32_t>& ids, KVCache& cach
   std::vector<float> proj(size_t(T) * H);   // o_proj / down_proj output, added back to x
   std::vector<float> gate(size_t(T) * I), up(size_t(T) * I);
 
-  // 1. Embedding: copy one row of the table per token.
+  // 1. Embedding: copy (and convert to FP32) one row of the table per token.
   for (int t = 0; t < T; ++t) {
     if (ids[t] < 0 || ids[t] >= V) throw std::runtime_error("token id out of range");
-    std::memcpy(&x[size_t(t) * H], &w_.embed[size_t(ids[t]) * H], sizeof(float) * H);
+    w_.embed.row_to_f32(ids[t], &x[size_t(t) * H]);
   }
   emit("embed", x, T, H);
 
@@ -63,9 +64,9 @@ std::vector<float> Model::forward(const std::vector<int32_t>& ids, KVCache& cach
 
     // --- attention block: x = x + o_proj(attention(rmsnorm(x))) ---
     rmsnorm(xn.data(), x.data(), L.input_norm.data(), T, H, cfg_.rms_norm_eps);
-    linear(q.data(), xn.data(), L.wq.data(), ptr_or_null(L.bq), T, H, QD);
-    linear(k.data(), xn.data(), L.wk.data(), ptr_or_null(L.bk), T, H, KVD);
-    linear(v.data(), xn.data(), L.wv.data(), ptr_or_null(L.bv), T, H, KVD);
+    matmul(q.data(), xn.data(), L.wq, ptr_or_null(L.bq), T);
+    matmul(k.data(), xn.data(), L.wk, ptr_or_null(L.bk), T);
+    matmul(v.data(), xn.data(), L.wv, ptr_or_null(L.bv), T);
     rope(q.data(), T, cfg_.num_heads, HD, pos0, cfg_.rope_theta);
     rope(k.data(), T, cfg_.num_kv_heads, HD, pos0, cfg_.rope_theta);
 
@@ -75,15 +76,15 @@ std::vector<float> Model::forward(const std::vector<int32_t>& ids, KVCache& cach
     attention(attn.data(), q.data(), k_cache, v_cache, T, pos0, cfg_.num_heads, cfg_.num_kv_heads,
               HD);
 
-    linear(proj.data(), attn.data(), L.wo.data(), nullptr, T, QD, H);
+    matmul(proj.data(), attn.data(), L.wo, nullptr, T);
     for (size_t i = 0; i < x.size(); ++i) x[i] += proj[i];
 
     // --- MLP block: x = x + down(silu(gate(rmsnorm(x))) * up(rmsnorm(x))) ---
     rmsnorm(xn.data(), x.data(), L.post_attn_norm.data(), T, H, cfg_.rms_norm_eps);
-    linear(gate.data(), xn.data(), L.w_gate.data(), nullptr, T, H, I);
-    linear(up.data(), xn.data(), L.w_up.data(), nullptr, T, H, I);
+    matmul(gate.data(), xn.data(), L.w_gate, nullptr, T);
+    matmul(up.data(), xn.data(), L.w_up, nullptr, T);
     for (size_t i = 0; i < gate.size(); ++i) gate[i] = silu(gate[i]) * up[i];
-    linear(proj.data(), gate.data(), L.w_down.data(), nullptr, T, I, H);
+    matmul(proj.data(), gate.data(), L.w_down, nullptr, T);
     for (size_t i = 0; i < x.size(); ++i) x[i] += proj[i];
 
     char name[32];
@@ -101,7 +102,7 @@ std::vector<float> Model::forward(const std::vector<int32_t>& ids, KVCache& cach
   const int rows = all_logits ? T : 1;
   const float* first_row = xn.data() + size_t(T - rows) * H;
   std::vector<float> logits(size_t(rows) * V);
-  linear(logits.data(), first_row, w_.lm_head_ptr(), nullptr, rows, H, V);
+  matmul(logits.data(), first_row, w_.lm_head_matrix(), nullptr, rows);
   emit("logits", logits, rows, V);
   return logits;
 }
