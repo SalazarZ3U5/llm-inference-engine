@@ -19,6 +19,9 @@ std::string device_description();
 std::unique_ptr<Runner> make_runner(const Config& cfg, const Weights& w, int max_tokens,
                                     bool use_graphs = true);
 
+// Multi-token matmuls (prefill) use tensor cores by default; switch off to compare.
+void set_tensor_cores(bool on);
+
 // Compares every CUDA kernel with the CPU reference on random data. Returns 0 if all pass.
 int run_selftest();
 

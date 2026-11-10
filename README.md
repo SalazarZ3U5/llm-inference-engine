@@ -8,7 +8,8 @@ Target model: **Qwen2.5-0.5B-Instruct** (download needs no license approval). De
 > Status: **Phase 3 (CUDA) nearly complete.** The whole forward pass runs on an RTX 4060 with
 > hand-written CUDA kernels and CUDA graphs: **213.8 tok/s decode with BF16** (211 GB/s, 97% of the
 > measured memory bandwidth) and **361.6 tok/s with INT8**, 127x the first working version, while still
-> matching Hugging Face at every layer. Next: tensor-core prefill and profiling, then Phase 4.
+> matching Hugging Face at every layer. Prefill uses tensor cores: **5,508 tok/s** on a 512-token
+> prompt. Next: profiling, then Phase 4 (flash attention for long contexts, batching).
 
 ## Layout
 
@@ -163,7 +164,8 @@ CUDA and one is present.
 - [x] `ie verify --device cuda` passes (30/30); `test-cuda` checks every kernel against the CPU code (96/96)
 - [x] CUDA graphs: each decode step (~243 kernels) recorded once and replayed with one call (+8%)
 - [x] INT8 weights on the GPU (per-row scales); perplexity identical to the CPU INT8 path (14.8453)
-- [ ] Tensor-core GEMM for prefill
+- [x] Tensor-core GEMM for prefill (WMMA, 64x64 tiles): FP32 activations split into two BF16 parts
+      (hi + lo) to keep FP32-level accuracy; BF16 and INT8 weights; 3.5x faster prefill, same perplexity
 - [ ] Profile with Nsight Systems / Nsight Compute; document each optimization
 
 ### Phase 4: advanced
@@ -189,6 +191,7 @@ CUDA and one is present.
 | 2026-11-10 | GPU: hand-written CUDA kernels, BF16, RTX 4060 | 190.8 | 1752.2 | 188.5 GB/s = 87% of measured VRAM bandwidth |
 | 2026-11-11 | GPU: CUDA graphs for decode, BF16 | 213.8 | 1763.8 | 211.3 GB/s = 97% of measured VRAM bandwidth |
 | 2026-11-11 | **GPU: INT8 weights + CUDA graphs** | **361.6** | 1100.5 | 127x the Phase 1 baseline; perplexity +0.5% |
+| 2026-11-11 | GPU: tensor-core prefill, BF16, 512-token prompt | 181.9 | **5507.9** | vs 1571.7 on CUDA cores (3.5x); decode is slower at this context length, see below |
 
 Full sweep (`ie bench --sweep`, 64-token prompt, 32 generated tokens) on a Ryzen 5 3600XT
 (6 cores / 12 threads, AVX2, dual-channel DDR4) and an RTX 4060 (8 GB):
@@ -211,6 +214,10 @@ CPU numbers vary by roughly 10-20% between runs with background load (the per-st
 table come from an earlier run). INT8 on the GPU no longer saturates memory bandwidth: converting
 int8 weights to floats now costs as much time as reading them, which also makes INT8 prefill slower
 than BF16. Quantizing activations too and using int8 dot-product instructions (`dp4a`) is the next step.
+
+At longer context, decode slows down (213.8 tok/s after a 64-token prompt, 181.9 after 512): the
+attention kernel loops over every cached position with one block per head, so its cost grows with
+the context. A flash-decoding style attention kernel (Phase 4) addresses this.
 
 Using all 12 hardware threads helps prefill (large, compute-bound calls) but cuts decode by up to 58%.
 Decode makes ~200 small parallel calls per token and each waits for its slowest thread; with every

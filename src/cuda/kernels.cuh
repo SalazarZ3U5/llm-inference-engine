@@ -34,7 +34,8 @@ void rmsnorm(float* y, const float* x, const float* weight, int T, int dim, floa
 
 // y[t, o] (+)= dot(W[o, :], x[t, :]) + bias[o]
 //   accumulate = true adds into y (fuses the residual connection: x += W·a).
-//   One warp per output row; each weight is loaded once per group of 4 tokens.
+//   T = 1 (decode): one warp per output row, streaming weights at full bandwidth.
+//   T >= 2 (prefill): tensor cores on 64 x 64 output tiles (see set_tensor_cores_impl).
 void matmul(float* y, const float* x, const DeviceMatrix& W, const float* bias, int T,
             bool accumulate, cudaStream_t stream);
 
@@ -58,5 +59,9 @@ void attention(float* out, const float* q, const float* k_cache, const float* v_
 
 // Largest context the attention kernel supports (its scores live in shared memory).
 int attention_max_tokens();
+
+// Multi-token matmuls (prefill) use tensor cores by default; switch off to compare.
+void set_tensor_cores_impl(bool on);
+bool tensor_cores();
 
 }  // namespace ie::cuda

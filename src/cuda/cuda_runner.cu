@@ -15,9 +15,25 @@
 #include "npy.h"
 #include "ops.h"
 
+// NVTX: named ranges that show up on the Nsight Systems timeline ("prefill",
+// "decode", ...). Header-only, and costs nothing when no profiler is attached.
+#if __has_include(<nvtx3/nvToolsExt.h>)
+#include <nvtx3/nvToolsExt.h>
+#define IE_NVTX_PUSH(name) nvtxRangePushA(name)
+#define IE_NVTX_POP() nvtxRangePop()
+#else
+#define IE_NVTX_PUSH(name) ((void)0)
+#define IE_NVTX_POP() ((void)0)
+#endif
+
 namespace ie::cuda {
 
 namespace {
+
+struct NvtxRange {
+  explicit NvtxRange(const char* name) { IE_NVTX_PUSH(name); }
+  ~NvtxRange() { IE_NVTX_POP(); }
+};
 
 void check(cudaError_t err, const char* what) {
   if (err != cudaSuccess)
@@ -174,6 +190,7 @@ class CudaRunner : public Runner {
     for (int32_t id : ids)
       if (id < 0 || id >= V) throw std::runtime_error("token id out of range");
     const int logit_rows = all_logits ? T : 1;
+    NvtxRange range(T == 1 ? "decode" : "prefill");
     reserve(T, logit_rows);  // before any capture: no allocations allowed inside a graph
 
     // A decode step (1 token, no inspection) replays the recorded graph.
@@ -265,6 +282,7 @@ class CudaRunner : public Runner {
   // costs a single launch instead of ~243, which matters most on Windows, where
   // each individual launch has noticeable driver overhead.
   void capture_decode_graph() {
+    NvtxRange range("capture decode graph");
     cudaGraph_t graph = nullptr;
     check(cudaStreamBeginCapture(stream_, cudaStreamCaptureModeThreadLocal), "cudaStreamBeginCapture");
     try {
@@ -357,6 +375,8 @@ std::string device_description() {
   return prop.name;
 }
 
+void set_tensor_cores(bool on) { ie::cuda::set_tensor_cores_impl(on); }
+
 std::unique_ptr<Runner> make_runner(const Config& cfg, const Weights& w, int max_tokens,
                                     bool use_graphs) {
   return std::make_unique<CudaRunner>(cfg, w, max_tokens, use_graphs);
@@ -416,8 +436,13 @@ int run_selftest() {
   // exact values the GPU holds. Column counts 72 and 75 exercise the slow path
   // (not a multiple of the 16-byte load width).
   struct Shape { int rows, cols; };
+  for (bool tc : {false, true})
   for (DType dt : {DType::BF16, DType::I8}) {
+    set_tensor_cores_impl(tc);
     const char* dn = dtype_name(dt);
+    const char* path = tc ? "tc" : "cuda-core";
+    // Split-BF16 tensor-core results are within ~1e-5 of FP32; allow a little more.
+    const double tol = tc ? 1e-4 : 2e-5;
     for (Shape sh : {Shape{37, 72}, Shape{37, 75}, Shape{128, 896}, Shape{300, 896}, Shape{64, 4864}}) {
       Matrix m = make_matrix(random_vec(rng, size_t(sh.rows) * sh.cols, 0.1f), sh.rows, sh.cols, dt);
       Matrix m2 = make_matrix(random_vec(rng, size_t(sh.rows) * sh.cols, 0.1f), sh.rows, sh.cols, dt);
@@ -425,7 +450,7 @@ int run_selftest() {
       std::vector<float> bias = random_vec(rng, sh.rows, 1.0f);
       DeviceMatrix dW = mem.upload_matrix(m), dW2 = mem.upload_matrix(m2);
       float* dbias = mem.upload(bias);
-      for (int T : {1, 2, 3, 4, 5, 9}) {
+      for (int T : {1, 2, 3, 4, 5, 9, 17, 64, 100}) {
         std::vector<float> x = random_vec(rng, size_t(T) * sh.cols, 1.0f);
         std::vector<float> y0 = random_vec(rng, size_t(T) * sh.rows, 1.0f);
         float* dx = mem.upload(x);
@@ -434,23 +459,23 @@ int run_selftest() {
         linear(want.data(), x.data(), deq.data(), bias.data(), T, sh.cols, sh.rows);
 
         matmul(dy, dx, dW, dbias, T, false, s);
-        std::snprintf(what, sizeof(what), "matmul %s %dx%d T=%d", dn, sh.rows, sh.cols, T);
-        tally.add(what, download(dy, want.size()), want);
+        std::snprintf(what, sizeof(what), "matmul %s %s %dx%d T=%d", path, dn, sh.rows, sh.cols, T);
+        tally.add(what, download(dy, want.size()), want, tol);
 
         check(cudaMemcpy(dy, y0.data(), y0.size() * sizeof(float), cudaMemcpyHostToDevice), "reset y");
         matmul(dy, dx, dW, dbias, T, true, s);
         std::vector<float> want_acc(want);
         for (size_t i = 0; i < want_acc.size(); ++i) want_acc[i] += y0[i];
-        std::snprintf(what, sizeof(what), "matmul+residual %s %dx%d T=%d", dn, sh.rows, sh.cols, T);
-        tally.add(what, download(dy, want.size()), want_acc);
+        std::snprintf(what, sizeof(what), "matmul+residual %s %s %dx%d T=%d", path, dn, sh.rows, sh.cols, T);
+        tally.add(what, download(dy, want.size()), want_acc, tol);
 
         std::vector<float> g(want.size()), u(want.size()), want_mlp(want.size());
         linear(g.data(), x.data(), deq.data(), nullptr, T, sh.cols, sh.rows);
         linear(u.data(), x.data(), deq2.data(), nullptr, T, sh.cols, sh.rows);
         for (size_t i = 0; i < g.size(); ++i) want_mlp[i] = silu(g[i]) * u[i];
         gate_up_silu(dy, dx, dW, dW2, T, s);
-        std::snprintf(what, sizeof(what), "gate_up_silu %s %dx%d T=%d", dn, sh.rows, sh.cols, T);
-        tally.add(what, download(dy, want.size()), want_mlp);
+        std::snprintf(what, sizeof(what), "gate_up_silu %s %s %dx%d T=%d", path, dn, sh.rows, sh.cols, T);
+        tally.add(what, download(dy, want.size()), want_mlp, tol);
       }
     }
 
@@ -467,6 +492,7 @@ int run_selftest() {
     std::snprintf(what, sizeof(what), "embedding %s", dn);
     tally.add(what, download(dx, want.size()), want, 0.0);
   }
+  set_tensor_cores_impl(true);
 
   // rmsnorm
   {
