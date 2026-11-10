@@ -13,9 +13,11 @@ namespace ie::cuda {
 bool device_available();
 std::string device_description();
 
-// Copies the model to the GPU. `w` must hold BF16 weights; it can be freed
-// afterwards. max_tokens sets the KV cache size in VRAM.
-std::unique_ptr<Runner> make_runner(const Config& cfg, const Weights& w, int max_tokens);
+// Copies the model to the GPU. `w` must hold BF16 or INT8 weights; it can be
+// freed afterwards. max_tokens sets the KV cache size in VRAM. use_graphs:
+// record each decode step once as a CUDA graph and replay it.
+std::unique_ptr<Runner> make_runner(const Config& cfg, const Weights& w, int max_tokens,
+                                    bool use_graphs = true);
 
 // Compares every CUDA kernel with the CPU reference on random data. Returns 0 if all pass.
 int run_selftest();

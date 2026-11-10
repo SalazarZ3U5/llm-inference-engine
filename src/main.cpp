@@ -12,7 +12,7 @@
 //   ie test-cuda                                   check every CUDA kernel against the CPU version
 //   ie gpu-check                                   GPU info + vector-add test + bandwidth test
 //
-// Performance options: --device cpu|cuda (default: cuda if available)
+// Performance options: --device cpu|cuda (default: cuda if available)  --no-graph (CUDA)
 //                      --weights f32|bf16|int8 (default bf16)  --threads N (default: physical cores)
 //                      --kernel scalar|avx2 (default: avx2 if compiled in)
 // Sampling options: --temp T  --top-k K  --top-p P  --rep R  --seed S  --greedy
@@ -87,7 +87,7 @@ void usage() {
       "  ie gpu-check\n"
       "\n"
       "options: --max-tokens N  --ctx N  --temp T  --top-k K  --top-p P  --rep R  --seed S  --greedy\n"
-      "         --device cpu|cuda  --weights f32|bf16|int8  --threads N  --kernel scalar|avx2\n");
+      "         --device cpu|cuda  --weights f32|bf16|int8  --threads N  --kernel scalar|avx2  --no-graph\n");
 }
 
 double seconds_since(Clock::time_point t0) {
@@ -161,6 +161,7 @@ struct Options {
   std::string system = kDefaultSystem;
   // Performance
   std::string device = "auto";  // auto = cuda if built with CUDA and a GPU is present
+  bool graphs = true;            // CUDA: replay each decode step as a recorded graph
   std::string weights = "bf16";
   int threads = 0;           // 0 = one per physical core
   std::string kernel;        // empty = default
@@ -188,6 +189,7 @@ Options parse_options(const std::vector<std::string>& args, size_t first) {
     else if (a == "--system") o.system = next();
     else if (a == "--weights") o.weights = next();
     else if (a == "--device") o.device = next();
+    else if (a == "--no-graph") o.graphs = false;
     else if (a == "--threads") o.threads = std::stoi(next());
     else if (a == "--kernel") o.kernel = next();
     else if (a == "--prompt-tokens") o.prompt_tokens = std::stoi(next());
@@ -243,17 +245,18 @@ std::string resolve_device(const std::string& d) {
 
 // Loads the model onto `device` with room for `max_tokens` tokens of context.
 std::unique_ptr<ie::Runner> load_runner(const fs::path& model_dir, const std::string& device,
-                                        ie::DType dtype, int max_tokens) {
+                                        ie::DType dtype, int max_tokens, bool graphs = true) {
+  (void)graphs;  // only the CUDA backend uses it
   auto t0 = Clock::now();
   ie::Config cfg = ie::load_config((model_dir / "config.json").string());
   ie::SafeTensorsFile st((model_dir / "model.safetensors").string());
   std::unique_ptr<ie::Runner> runner;
   if (device == "cuda") {
 #ifdef IE_WITH_CUDA
-    if (dtype != ie::DType::BF16)
-      throw std::runtime_error("the CUDA backend runs BF16 weights only (drop --weights or use bf16)");
+    if (dtype == ie::DType::F32)
+      throw std::runtime_error("the CUDA backend runs bf16 or int8 weights (use --weights bf16 or int8)");
     ie::Weights w = ie::load_weights(st, cfg, dtype);
-    runner = ie::cuda::make_runner(cfg, w, max_tokens);  // copies to VRAM; `w` is freed here
+    runner = ie::cuda::make_runner(cfg, w, max_tokens, graphs);  // copies to VRAM; `w` is freed here
 #endif
   } else {
     runner = ie::make_cpu_runner(cfg, ie::load_weights(st, cfg, dtype), max_tokens);
@@ -266,7 +269,8 @@ std::unique_ptr<ie::Runner> load_runner(const fs::path& model_dir, const std::st
 
 std::unique_ptr<ie::Runner> load_runner(const fs::path& model_dir, const Options& o, int max_tokens) {
   apply_compute_options(o);
-  return load_runner(model_dir, resolve_device(o.device), ie::parse_dtype(o.weights), max_tokens);
+  return load_runner(model_dir, resolve_device(o.device), ie::parse_dtype(o.weights), max_tokens,
+                     o.graphs);
 }
 
 // --------------------------------------------------------- generation ----
@@ -509,7 +513,7 @@ int cmd_bench(const Options& o) {
   const fs::path model_dir = o.positional[0];
   ie::Tokenizer tok(model_dir.string());
 
-  struct Cfg { std::string device, weights; ie::Kernel kernel; int threads; };
+  struct Cfg { std::string device, weights; ie::Kernel kernel; int threads; bool graphs = true; };
   std::vector<Cfg> cfgs;
   const int all = hardware_threads(), cores = ie::physical_cores();
   const ie::Kernel fast = ie::avx2_available() ? ie::Kernel::Avx2 : ie::Kernel::Scalar;
@@ -519,17 +523,22 @@ int cmd_bench(const Options& o) {
             {"cpu", "f32", fast, cores},           {"cpu", "f32", fast, all},
             {"cpu", "bf16", fast, cores},          {"cpu", "bf16", fast, all},
             {"cpu", "int8", fast, cores},          {"cpu", "int8", fast, all}};
-    if (cuda_available()) cfgs.push_back({"cuda", "bf16", fast, cores});
+    if (cuda_available()) {
+      cfgs.push_back({"cuda", "bf16", fast, cores, false});
+      cfgs.push_back({"cuda", "bf16", fast, cores, true});
+      cfgs.push_back({"cuda", "int8", fast, cores, true});
+    }
   } else {
     cfgs = {{resolve_device(o.device), o.weights,
              o.kernel.empty() ? ie::current_kernel() : ie::parse_kernel(o.kernel),
-             o.threads > 0 ? o.threads : cores}};
+             o.threads > 0 ? o.threads : cores, o.graphs}};
   }
   // On machines with few threads some sweep entries coincide; run each once.
   cfgs.erase(std::unique(cfgs.begin(), cfgs.end(),
                          [](const Cfg& a, const Cfg& b) {
                            return a.device == b.device && a.weights == b.weights &&
-                                  a.kernel == b.kernel && a.threads == b.threads;
+                                  a.kernel == b.kernel && a.threads == b.threads &&
+                                  a.graphs == b.graphs;
                          }),
              cfgs.end());
 
@@ -542,16 +551,17 @@ int cmd_bench(const Options& o) {
   for (const Cfg& c : cfgs) {
     ie::set_num_threads(c.threads);
     ie::set_kernel(c.kernel);
-    if (loaded != c.device + "/" + c.weights) {
+    const std::string key = c.device + "/" + c.weights + (c.graphs ? "/graphs" : "");
+    if (loaded != key) {
       model.reset();  // free the previous copy first
       model = load_runner(model_dir, c.device, ie::parse_dtype(c.weights),
-                          o.prompt_tokens + o.gen_tokens + 8);
-      loaded = c.device + "/" + c.weights;
+                          o.prompt_tokens + o.gen_tokens + 8, c.graphs);
+      loaded = key;
     }
     BenchResult r = run_bench(*model, tok, o.prompt_tokens, o.gen_tokens);
     const bool gpu = c.device == "cuda";
     std::printf("| %s | %s | %s | %s | %.1f | %.1f | %.1f |\n", c.device.c_str(), c.weights.c_str(),
-                gpu ? "cuda" : ie::kernel_name(c.kernel),
+                gpu ? (c.graphs ? "cuda graph" : "cuda") : ie::kernel_name(c.kernel),
                 gpu ? "-" : std::to_string(c.threads).c_str(), r.prefill_tps, r.decode_tps, r.gbps);
     std::fflush(stdout);
   }
