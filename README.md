@@ -5,9 +5,10 @@ It loads Hugging Face `safetensors` weights and generates text on an NVIDIA GPU.
 
 Target model: **Qwen2.5-0.5B-Instruct** (download needs no license approval). Development GPU: RTX 4060 (sm_89, 8 GB).
 
-> Status: **Phase 2 complete.** Fast CPU inference: a custom thread pool, cache-blocked AVX2/FMA
-> matmul kernels, and BF16 or INT8 weights. BF16 still matches Hugging Face at every layer; INT8 halves
-> memory traffic again for a 0.5% perplexity cost. Next: Phase 3, CUDA.
+> Status: **Phase 3, part 1 complete.** The whole forward pass runs on the GPU with hand-written CUDA
+> kernels: **190.8 tok/s decode** (188.5 GB/s, 87% of measured memory bandwidth) and **1,752 tok/s
+> prefill** on an RTX 4060, 6x the best CPU result, while still matching Hugging Face at every layer.
+> Next: CUDA graphs, tensor-core prefill, INT8 on the GPU.
 
 ## Layout
 
@@ -28,9 +29,13 @@ src/
   sampler.{h,cpp}       temperature, top-k, top-p, repetition penalty; defaults from generation_config.json
   matrix.{h,cpp}        weight matrices as f32 / bf16 / int8; blocked matmul with scalar and AVX2 kernels
   threadpool.{h,cpp}    fixed thread pool for parallel loops (spins briefly, then sleeps)
+  runner.{h,cpp}        Runner interface (weights + KV cache on one device); CPU implementation
   cuda/
     cuda_check.cuh      CUDA_CHECK error macro
     device_check.cu     GPU info, vector-add test, memory-bandwidth test
+    kernels.{cuh,cu}    GPU kernels: embedding, RMSNorm, BF16 matmul (warp per row), fused
+                        gate/up/SiLU, RoPE + KV-cache write, attention
+    cuda_runner.{h,cu}  GPU Runner: BF16 weights and KV cache in VRAM; `test-cuda` self-test
 scripts/
   download_model.py     fetch weights + tokenizer into models/
   reference.py          dump ground-truth activations from HF transformers into reference/
@@ -110,12 +115,16 @@ Performance options for every command that runs the model: `--weights f32|bf16|i
 build\release\ie.exe bench models\qwen2.5-0.5b-instruct --sweep
 build\release\ie.exe perplexity models\qwen2.5-0.5b-instruct tests\perplexity.txt --weights int8
 build\release\ie.exe test-kernels
+build\release\ie.exe test-cuda
 ```
 
 `bench --sweep` walks through every optimization step (scalar → AVX2 → threads → BF16 → INT8) and
 prints a table of prefill and decode speed. `perplexity` scores how well the model predicts a fixed
 text (lower is better), which is how INT8 is checked against BF16. `test-kernels` checks every matmul
-kernel against the plain reference implementation.
+kernel against the plain reference implementation, and `test-cuda` does the same for every GPU kernel.
+
+Every command that runs the model takes `--device cpu|cuda`. The default is the GPU when the build has
+CUDA and one is present.
 
 ## Roadmap
 
@@ -147,10 +156,13 @@ kernel against the plain reference implementation.
 - [x] INT8 per-row quantization: perplexity 14.85 vs 14.78 for BF16 (+0.5%), same greedy output
 
 ### Phase 3: CUDA
-- [ ] Weights resident on GPU in FP16/BF16
-- [ ] cuBLAS GEMM baseline end to end
-- [ ] Custom kernels: RMSNorm, RoPE, softmax, fused SiLU*up
-- [ ] Own GEMV kernel for decode (memory-bound): approach the `gpu-check` bandwidth
+- [x] Runner interface so every command runs on CPU or GPU (`--device`)
+- [x] BF16 weights and FP32 KV cache resident in VRAM; whole forward pass on the GPU
+- [x] Own kernels: BF16 matmul (one warp per row, coalesced 16-byte loads), RMSNorm, RoPE + cache
+      write, attention, fused gate/up/SiLU, residual adds fused into the matmuls
+- [x] `ie verify --device cuda` passes (30/30); `test-cuda` checks every kernel against the CPU code (96/96)
+- [ ] CUDA graphs to remove per-kernel launch overhead in decode
+- [ ] Tensor-core GEMM for prefill
 - [ ] Profile with Nsight Systems / Nsight Compute; document each optimization
 
 ### Phase 4: advanced
@@ -172,7 +184,8 @@ kernel against the plain reference implementation.
 | 2026-11-10 | AVX2 + FMA kernels, 1 thread | 11.1 | 70.6 | 8 multiply-adds per instruction |
 | 2026-11-10 | Thread pool, 6 threads (one per physical core) | 17.0 | 184.7 | decode now limited by RAM bandwidth (33.6 GB/s) |
 | 2026-11-10 | BF16 weight storage, 6 threads | 31.5 | 207.2 | half the bytes per token, still exact |
-| 2026-11-10 | INT8 weights (per-row scales), 6 threads | **59.8** | 222.9 | quarter of FP32's bytes; perplexity +0.5% |
+| 2026-11-10 | INT8 weights (per-row scales), 6 threads | 59.8 | 222.9 | quarter of FP32's bytes; perplexity +0.5% |
+| 2026-11-10 | **GPU: hand-written CUDA kernels, BF16, RTX 4060** | **190.8** | **1752.2** | 188.5 GB/s = 87% of measured VRAM bandwidth |
 
 Full sweep (`ie bench --sweep`, 64-token prompt, 32 generated tokens) on a Ryzen 5 3600XT
 (6 cores / 12 threads, AVX2) with dual-channel DDR4:

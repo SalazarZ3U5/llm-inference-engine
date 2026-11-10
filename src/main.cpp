@@ -9,9 +9,11 @@
 //   ie bench    <model_dir> [--sweep]              measure prefill and decode speed
 //   ie perplexity <model_dir> <text_file>          measure model quality on a text
 //   ie test-kernels                                check the fast matmul kernels against the reference
+//   ie test-cuda                                   check every CUDA kernel against the CPU version
 //   ie gpu-check                                   GPU info + vector-add test + bandwidth test
 //
-// Performance options: --weights f32|bf16|int8 (default bf16)  --threads N (default: physical cores)
+// Performance options: --device cpu|cuda (default: cuda if available)
+//                      --weights f32|bf16|int8 (default bf16)  --threads N (default: physical cores)
 //                      --kernel scalar|avx2 (default: avx2 if compiled in)
 // Sampling options: --temp T  --top-k K  --top-p P  --rep R  --seed S  --greedy
 //   (defaults come from the model's generation_config.json)
@@ -39,6 +41,7 @@
 #include "matrix.h"
 #include "model.h"
 #include "npy.h"
+#include "runner.h"
 #include "safetensors.h"
 #include "ops.h"
 #include "sampler.h"
@@ -47,6 +50,7 @@
 #include "weights.h"
 
 #ifdef IE_WITH_CUDA
+#include "cuda/cuda_runner.h"
 #include "cuda/device_check.h"
 #endif
 
@@ -79,10 +83,11 @@ void usage() {
       "  ie bench    <model_dir> [--sweep] [--prompt-tokens N] [--gen-tokens N]\n"
       "  ie perplexity <model_dir> <text_file>\n"
       "  ie test-kernels\n"
+      "  ie test-cuda\n"
       "  ie gpu-check\n"
       "\n"
       "options: --max-tokens N  --ctx N  --temp T  --top-k K  --top-p P  --rep R  --seed S  --greedy\n"
-      "         --weights f32|bf16|int8  --threads N  --kernel scalar|avx2\n");
+      "         --device cpu|cuda  --weights f32|bf16|int8  --threads N  --kernel scalar|avx2\n");
 }
 
 double seconds_since(Clock::time_point t0) {
@@ -155,6 +160,7 @@ struct Options {
   bool chat = false;
   std::string system = kDefaultSystem;
   // Performance
+  std::string device = "auto";  // auto = cuda if built with CUDA and a GPU is present
   std::string weights = "bf16";
   int threads = 0;           // 0 = one per physical core
   std::string kernel;        // empty = default
@@ -181,6 +187,7 @@ Options parse_options(const std::vector<std::string>& args, size_t first) {
     else if (a == "--chat") o.chat = true;
     else if (a == "--system") o.system = next();
     else if (a == "--weights") o.weights = next();
+    else if (a == "--device") o.device = next();
     else if (a == "--threads") o.threads = std::stoi(next());
     else if (a == "--kernel") o.kernel = next();
     else if (a == "--prompt-tokens") o.prompt_tokens = std::stoi(next());
@@ -217,21 +224,49 @@ void apply_compute_options(const Options& o) {
   if (!o.kernel.empty()) ie::set_kernel(ie::parse_kernel(o.kernel));
 }
 
-std::unique_ptr<ie::Model> load_model(const fs::path& model_dir, ie::DType dtype) {
+bool cuda_available() {
+#ifdef IE_WITH_CUDA
+  return ie::cuda::device_available();
+#else
+  return false;
+#endif
+}
+
+// "auto" -> "cuda" when this build has CUDA and a GPU is present, else "cpu".
+std::string resolve_device(const std::string& d) {
+  if (d == "auto") return cuda_available() ? "cuda" : "cpu";
+  if (d == "cuda" && !cuda_available())
+    throw std::runtime_error("--device cuda: no CUDA GPU available (or this build has no CUDA support)");
+  if (d != "cpu" && d != "cuda") throw std::runtime_error("unknown device '" + d + "' (use cpu or cuda)");
+  return d;
+}
+
+// Loads the model onto `device` with room for `max_tokens` tokens of context.
+std::unique_ptr<ie::Runner> load_runner(const fs::path& model_dir, const std::string& device,
+                                        ie::DType dtype, int max_tokens) {
   auto t0 = Clock::now();
   ie::Config cfg = ie::load_config((model_dir / "config.json").string());
   ie::SafeTensorsFile st((model_dir / "model.safetensors").string());
-  auto model = std::make_unique<ie::Model>(cfg, ie::load_weights(st, cfg, dtype));
-  std::fprintf(stderr, "[loaded %.1fM parameters as %s (%.0f MiB) in %.1f s | %d threads | %s kernels]\n",
-               model->weights().num_params() / 1e6, ie::dtype_name(dtype),
-               model->weights().matrix_bytes() / 1048576.0, seconds_since(t0),
-               ie::thread_pool().num_threads(), ie::kernel_name(ie::current_kernel()));
-  return model;
+  std::unique_ptr<ie::Runner> runner;
+  if (device == "cuda") {
+#ifdef IE_WITH_CUDA
+    if (dtype != ie::DType::BF16)
+      throw std::runtime_error("the CUDA backend runs BF16 weights only (drop --weights or use bf16)");
+    ie::Weights w = ie::load_weights(st, cfg, dtype);
+    runner = ie::cuda::make_runner(cfg, w, max_tokens);  // copies to VRAM; `w` is freed here
+#endif
+  } else {
+    runner = ie::make_cpu_runner(cfg, ie::load_weights(st, cfg, dtype), max_tokens);
+  }
+  std::fprintf(stderr, "[loaded %.1fM parameters as %s (%.0f MiB) in %.1f s | %s]\n",
+               runner->num_params() / 1e6, ie::dtype_name(dtype), runner->weight_bytes() / 1048576.0,
+               seconds_since(t0), runner->device_name().c_str());
+  return runner;
 }
 
-std::unique_ptr<ie::Model> load_model(const fs::path& model_dir, const Options& o) {
+std::unique_ptr<ie::Runner> load_runner(const fs::path& model_dir, const Options& o, int max_tokens) {
   apply_compute_options(o);
-  return load_model(model_dir, ie::parse_dtype(o.weights));
+  return load_runner(model_dir, resolve_device(o.device), ie::parse_dtype(o.weights), max_tokens);
 }
 
 // --------------------------------------------------------- generation ----
@@ -242,11 +277,11 @@ struct GenResult {
   bool hit_stop = false;
 };
 
-// Feeds `prompt` after whatever is already in `cache`, then samples up to
+// Feeds `prompt` after whatever is already in the KV cache, then samples up to
 // `max_new` tokens, printing text as it is produced. Every generated token
 // except a stop token is run through the model, so the cache always holds the
 // full conversation. `history` collects all token ids (for the repetition penalty).
-GenResult generate(const ie::Model& model, ie::KVCache& cache, const ie::Tokenizer& tok,
+GenResult generate(ie::Runner& model, const ie::Tokenizer& tok,
                    ie::Sampler& sampler, std::vector<int32_t>& history,
                    const std::vector<int32_t>& prompt, int max_new,
                    const std::vector<int32_t>& stop_ids) {
@@ -255,7 +290,7 @@ GenResult generate(const ie::Model& model, ie::KVCache& cache, const ie::Tokeniz
   r.prompt_tokens = static_cast<int>(prompt.size());
 
   auto t0 = Clock::now();
-  std::vector<float> logits = model.forward(prompt, cache);  // prefill
+  std::vector<float> logits = model.forward(prompt);  // prefill
   r.prefill_s = seconds_since(t0);
   history.insert(history.end(), prompt.begin(), prompt.end());
 
@@ -271,11 +306,11 @@ GenResult generate(const ie::Model& model, ie::KVCache& cache, const ie::Tokeniz
     ++r.new_tokens;
     std::fputs(out.push(next).c_str(), stdout);
     std::fflush(stdout);
-    if (cache.len >= cache.max_tokens) {
+    if (model.position() >= model.max_tokens()) {
       std::fputs("\n[context full]", stdout);
       break;
     }
-    logits = model.forward({next}, cache);  // decode step: one token
+    logits = model.forward({next});  // decode step: one token
   }
   std::fputs(out.flush().c_str(), stdout);
   r.decode_s = seconds_since(t1);
@@ -300,18 +335,16 @@ std::string chat_turn(const std::string& system, const std::string& user, bool f
 int cmd_generate(const Options& o) {
   if (o.positional.size() < 2) { usage(); return 1; }
   const fs::path model_dir = o.positional[0];
-  auto model = load_model(model_dir, o);
   ie::Tokenizer tok(model_dir.string());
-  ie::Sampler sampler(sampling_for(o, model_dir.string()));
-
   std::string text = o.chat ? chat_turn(o.system, o.positional[1], true) : o.positional[1];
   std::vector<int32_t> prompt = tok.encode(text);
-  ie::KVCache cache = model->make_cache(std::min<int>(o.ctx, int(prompt.size()) + o.max_tokens + 1));
+  auto model = load_runner(model_dir, o, std::min<int>(o.ctx, int(prompt.size()) + o.max_tokens + 1));
+  ie::Sampler sampler(sampling_for(o, model_dir.string()));
   std::vector<int32_t> history;
   std::vector<int32_t> stops = {tok.special_id("<|im_end|>"), tok.special_id("<|endoftext|>")};
 
   if (!o.chat) std::fputs(o.positional[1].c_str(), stdout);
-  GenResult r = generate(*model, cache, tok, sampler, history, prompt, o.max_tokens, stops);
+  GenResult r = generate(*model, tok, sampler, history, prompt, o.max_tokens, stops);
   std::fputs("\n", stdout);
   print_stats(r);
   std::fprintf(stderr, "[seed %llu]\n", static_cast<unsigned long long>(sampler.seed()));
@@ -321,11 +354,11 @@ int cmd_generate(const Options& o) {
 int cmd_chat(const Options& o) {
   if (o.positional.empty()) { usage(); return 1; }
   const fs::path model_dir = o.positional[0];
-  auto model = load_model(model_dir, o);
+  auto model = load_runner(model_dir, o, o.ctx);
   ie::Tokenizer tok(model_dir.string());
   ie::Sampler sampler(sampling_for(o, model_dir.string()));
-  ie::KVCache cache = model->make_cache(o.ctx);
-  std::fprintf(stderr, "[KV cache: %d tokens, %.0f MiB]\n", o.ctx, cache.bytes() / 1048576.0);
+  std::fprintf(stderr, "[KV cache: %d tokens, %.0f MiB]\n", model->max_tokens(),
+               model->kv_cache_bytes() / 1048576.0);
   std::vector<int32_t> stops = {tok.special_id("<|im_end|>"), tok.special_id("<|endoftext|>")};
   std::vector<int32_t> history;
   bool first = true;
@@ -338,7 +371,7 @@ int cmd_chat(const Options& o) {
     if (!read_line(line)) break;
     if (line == "/exit" || line == "/quit") break;
     if (line == "/reset") {
-      cache.clear();
+      model->reset();
       history.clear();
       first = true;
       std::printf("[conversation cleared]\n");
@@ -347,15 +380,15 @@ int cmd_chat(const Options& o) {
     if (line.empty()) continue;
 
     std::vector<int32_t> prompt = tok.encode(chat_turn(o.system, line, first));
-    if (cache.len + int(prompt.size()) + o.max_tokens + 1 > cache.max_tokens) {
+    if (model->position() + int(prompt.size()) + o.max_tokens + 1 > model->max_tokens()) {
       std::printf("[context full: starting a new conversation]\n");
-      cache.clear();
+      model->reset();
       history.clear();
       prompt = tok.encode(chat_turn(o.system, line, true));
     }
     first = false;
     std::printf("\n");
-    GenResult r = generate(*model, cache, tok, sampler, history, prompt, o.max_tokens, stops);
+    GenResult r = generate(*model, tok, sampler, history, prompt, o.max_tokens, stops);
     std::printf("\n");
     print_stats(r);
   }
@@ -442,23 +475,24 @@ struct BenchResult {
 
 // Prefill `prompt_tokens` tokens in one call, then decode `gen_tokens` tokens
 // one at a time (greedy, no sampling cost), with the current thread/kernel settings.
-BenchResult run_bench(const ie::Model& model, const ie::Tokenizer& tok, int prompt_tokens,
+BenchResult run_bench(ie::Runner& model, const ie::Tokenizer& tok, int prompt_tokens,
                       int gen_tokens) {
   std::vector<int32_t> unit = tok.encode(kBenchText), prompt;
   while (int(prompt.size()) < prompt_tokens) prompt.insert(prompt.end(), unit.begin(), unit.end());
   prompt.resize(prompt_tokens);
   const int V = model.config().vocab_size;
 
-  {  // warm-up: wake the threads, fault in memory
-    ie::KVCache warm = model.make_cache(8);
-    model.forward({prompt.begin(), prompt.begin() + 4}, warm);
-  }
-  ie::KVCache cache = model.make_cache(prompt_tokens + gen_tokens);
+  // Warm-up: wakes the threads / GPU, faults in memory, allocates scratch buffers.
+  model.reset();
+  model.forward(prompt);
+  model.forward({prompt[0]});
+  model.reset();
+
   auto t0 = Clock::now();
-  std::vector<float> logits = model.forward(prompt, cache);
+  std::vector<float> logits = model.forward(prompt);
   const double prefill_s = seconds_since(t0);
   auto t1 = Clock::now();
-  for (int i = 0; i < gen_tokens; ++i) logits = model.forward({ie::argmax(logits.data(), V)}, cache);
+  for (int i = 0; i < gen_tokens; ++i) logits = model.forward({ie::argmax(logits.data(), V)});
   const double decode_s = seconds_since(t1);
 
   BenchResult r;
@@ -466,7 +500,7 @@ BenchResult run_bench(const ie::Model& model, const ie::Tokenizer& tok, int prom
   r.decode_tps = gen_tokens / decode_s;
   // Each decode step streams every weight matrix once (the tied embedding is
   // read in full as the LM head), so this is the memory bandwidth achieved.
-  r.gbps = r.decode_tps * double(model.weights().matrix_bytes()) / 1e9;
+  r.gbps = r.decode_tps * double(model.weight_bytes()) / 1e9;
   return r;
 }
 
@@ -475,44 +509,50 @@ int cmd_bench(const Options& o) {
   const fs::path model_dir = o.positional[0];
   ie::Tokenizer tok(model_dir.string());
 
-  struct Cfg { std::string weights; ie::Kernel kernel; int threads; };
+  struct Cfg { std::string device, weights; ie::Kernel kernel; int threads; };
   std::vector<Cfg> cfgs;
   const int all = hardware_threads(), cores = ie::physical_cores();
   const ie::Kernel fast = ie::avx2_available() ? ie::Kernel::Avx2 : ie::Kernel::Scalar;
   if (o.sweep) {
-    // The Phase 2 story, one step at a time.
-    cfgs = {{"f32", ie::Kernel::Scalar, 1}, {"f32", fast, 1},  {"f32", fast, cores},
-            {"f32", fast, all},              {"bf16", fast, cores}, {"bf16", fast, all},
-            {"int8", fast, cores},            {"int8", fast, all}};
+    // The whole story, one step at a time: Phase 2 on the CPU, then the GPU.
+    cfgs = {{"cpu", "f32", ie::Kernel::Scalar, 1}, {"cpu", "f32", fast, 1},
+            {"cpu", "f32", fast, cores},           {"cpu", "f32", fast, all},
+            {"cpu", "bf16", fast, cores},          {"cpu", "bf16", fast, all},
+            {"cpu", "int8", fast, cores},          {"cpu", "int8", fast, all}};
+    if (cuda_available()) cfgs.push_back({"cuda", "bf16", fast, cores});
   } else {
-    cfgs = {{o.weights, o.kernel.empty() ? ie::current_kernel() : ie::parse_kernel(o.kernel),
+    cfgs = {{resolve_device(o.device), o.weights,
+             o.kernel.empty() ? ie::current_kernel() : ie::parse_kernel(o.kernel),
              o.threads > 0 ? o.threads : cores}};
   }
   // On machines with few threads some sweep entries coincide; run each once.
   cfgs.erase(std::unique(cfgs.begin(), cfgs.end(),
                          [](const Cfg& a, const Cfg& b) {
-                           return a.weights == b.weights && a.kernel == b.kernel &&
-                                  a.threads == b.threads;
+                           return a.device == b.device && a.weights == b.weights &&
+                                  a.kernel == b.kernel && a.threads == b.threads;
                          }),
              cfgs.end());
 
   std::printf("prompt %d tokens, generate %d tokens, %d physical cores, %d hardware threads\n\n",
               o.prompt_tokens, o.gen_tokens, cores, all);
-  std::printf("| Weights | Kernel | Threads | Prefill tok/s | Decode tok/s | Decode GB/s |\n");
-  std::printf("|---------|--------|--------:|--------------:|-------------:|------------:|\n");
-  std::unique_ptr<ie::Model> model;
+  std::printf("| Device | Weights | Kernel | Threads | Prefill tok/s | Decode tok/s | Decode GB/s |\n");
+  std::printf("|--------|---------|--------|--------:|--------------:|-------------:|------------:|\n");
+  std::unique_ptr<ie::Runner> model;
   std::string loaded;
   for (const Cfg& c : cfgs) {
     ie::set_num_threads(c.threads);
     ie::set_kernel(c.kernel);
-    if (loaded != c.weights) {
+    if (loaded != c.device + "/" + c.weights) {
       model.reset();  // free the previous copy first
-      model = load_model(model_dir, ie::parse_dtype(c.weights));
-      loaded = c.weights;
+      model = load_runner(model_dir, c.device, ie::parse_dtype(c.weights),
+                          o.prompt_tokens + o.gen_tokens + 8);
+      loaded = c.device + "/" + c.weights;
     }
     BenchResult r = run_bench(*model, tok, o.prompt_tokens, o.gen_tokens);
-    std::printf("| %s | %s | %d | %.1f | %.1f | %.1f |\n", c.weights.c_str(),
-                ie::kernel_name(c.kernel), c.threads, r.prefill_tps, r.decode_tps, r.gbps);
+    const bool gpu = c.device == "cuda";
+    std::printf("| %s | %s | %s | %s | %.1f | %.1f | %.1f |\n", c.device.c_str(), c.weights.c_str(),
+                gpu ? "cuda" : ie::kernel_name(c.kernel),
+                gpu ? "-" : std::to_string(c.threads).c_str(), r.prefill_tps, r.decode_tps, r.gbps);
     std::fflush(stdout);
   }
   return 0;
@@ -526,7 +566,6 @@ int cmd_bench(const Options& o) {
 int cmd_perplexity(const Options& o) {
   if (o.positional.size() < 2) { usage(); return 1; }
   const fs::path model_dir = o.positional[0];
-  auto model = load_model(model_dir, o);
   ie::Tokenizer tok(model_dir.string());
   std::ifstream f(fs::path(o.positional[1]), std::ios::binary);
   if (!f) throw std::runtime_error("cannot open " + o.positional[1]);
@@ -535,17 +574,17 @@ int cmd_perplexity(const Options& o) {
   std::vector<int32_t> ids = tok.encode(text, /*allow_special=*/false);
   if (int(ids.size()) > o.ctx) ids.resize(o.ctx);
   if (ids.size() < 2) throw std::runtime_error("text too short");
+  auto model = load_runner(model_dir, o, int(ids.size()));
   const int V = model->config().vocab_size, chunk = 128;
 
   // Feed the text in chunks through the KV cache; logits at position i score token i+1.
-  ie::KVCache cache = model->make_cache(int(ids.size()));
   double nll = 0;
   int scored = 0;
   auto t0 = Clock::now();
   for (size_t start = 0; start < ids.size(); start += chunk) {
     const size_t end = std::min(ids.size(), start + chunk);
     std::vector<int32_t> part(ids.begin() + start, ids.begin() + end);
-    std::vector<float> logits = model->forward(part, cache, /*all_logits=*/true);
+    std::vector<float> logits = model->forward(part, /*all_logits=*/true);
     for (size_t i = start; i < end && i + 1 < ids.size(); ++i) {
       const float* row = logits.data() + (i - start) * size_t(V);
       double mx = row[0];
@@ -557,8 +596,9 @@ int cmd_perplexity(const Options& o) {
     }
   }
   const double s = seconds_since(t0);
-  std::printf("%s weights: perplexity %.4f over %d tokens (%.1f s, %.1f tok/s)\n",
-              ie::dtype_name(model->weights().dtype), std::exp(nll / scored), scored, s,
+  std::printf("%s weights on %s: perplexity %.4f over %d tokens (%.1f s, %.1f tok/s)\n",
+              ie::dtype_name(model->weight_dtype()), model->device_name().c_str(),
+              std::exp(nll / scored), scored, s,
               ids.size() / s);
   return 0;
 }
@@ -614,6 +654,19 @@ int cmd_test_kernels(const Options&) {
   return failures ? 1 : 0;
 }
 
+int cmd_test_cuda(const Options&) {
+#ifdef IE_WITH_CUDA
+  if (!ie::cuda::device_available()) {
+    std::printf("No CUDA GPU found.\n");
+    return 1;
+  }
+  return ie::cuda::run_selftest();
+#else
+  std::printf("Built without CUDA (IE_ENABLE_CUDA=OFF).\n");
+  return 1;
+#endif
+}
+
 // ------------------------------------------------------------- verify ----
 
 // Error budget per stage. The embedding is a pure copy of converted weights,
@@ -631,7 +684,7 @@ double tolerance(const std::string& stage) { return stage == "embed" ? 0.0 : 1e-
 int cmd_verify(const Options& o) {
   if (o.positional.size() < 2) { usage(); return 1; }
   const fs::path model_dir = o.positional[0], ref_dir = o.positional[1];
-  auto model = load_model(model_dir, o);
+  auto model = load_runner(model_dir, o, o.ctx);
   const ie::Config& cfg = model->config();
   ie::Tokenizer tok(model_dir.string());
 
@@ -642,7 +695,7 @@ int cmd_verify(const Options& o) {
   // INT8 weights are an approximation, so their numbers can't match the
   // reference to 1e-3. Show the errors for information, and judge quality
   // with `ie perplexity` instead.
-  const bool lossy = model->weights().dtype == ie::DType::I8;
+  const bool lossy = model->weight_dtype() == ie::DType::I8;
   if (lossy)
     std::printf("\nINT8 weights are approximate: model errors below are shown for information only.\n"
                 "Use `ie perplexity` to measure INT8 quality.\n");
@@ -686,9 +739,9 @@ int cmd_verify(const Options& o) {
     std::printf("\n");
   };
   {
-    ie::KVCache cache = model->make_cache(int(ids.size()));
+    model->reset();
     auto t0 = Clock::now();
-    model->forward(ids, cache, /*all_logits=*/true, check);
+    model->forward(ids, /*all_logits=*/true, check);
     std::printf("[forward pass over %zu tokens: %.2f s]\n\n", ids.size(), seconds_since(t0));
   }
 
@@ -712,14 +765,14 @@ int cmd_verify(const Options& o) {
     ie::SamplingParams greedy = ie::load_generation_config(model_dir.string());
     greedy.temperature = 0.0f;
     ie::Sampler sampler(greedy);
-    ie::KVCache cache = model->make_cache(int(ids.size() + want.size()));
+    model->reset();
     auto t0 = Clock::now();
-    std::vector<float> logits = model->forward(ids, cache);
+    std::vector<float> logits = model->forward(ids);
     std::vector<int32_t> history = ids, got;
     for (size_t i = 0; i < want.size(); ++i) {
       got.push_back(sampler.sample(logits.data(), cfg.vocab_size, history));
       history.push_back(got.back());
-      if (i + 1 < want.size()) logits = model->forward({got.back()}, cache);
+      if (i + 1 < want.size()) logits = model->forward({got.back()});
     }
     const double s = seconds_since(t0);
     size_t first_bad = 0;
@@ -792,6 +845,7 @@ int main(int argc, char** argv) {
     if (cmd == "bench") return cmd_bench(o);
     if (cmd == "perplexity") return cmd_perplexity(o);
     if (cmd == "test-kernels") return cmd_test_kernels(o);
+    if (cmd == "test-cuda") return cmd_test_cuda(o);
   } catch (const std::exception& e) {
     std::fprintf(stderr, "error: %s\n", e.what());
     return 1;

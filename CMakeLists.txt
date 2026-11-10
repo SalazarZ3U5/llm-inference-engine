@@ -44,6 +44,7 @@ add_library(ie_core
   src/sampler.cpp
   src/threadpool.cpp
   src/matrix.cpp
+  src/runner.cpp
 )
 target_include_directories(ie_core PUBLIC src)
 find_package(Threads REQUIRED)
@@ -58,7 +59,7 @@ if(IE_AVX2)
 endif()
 
 if(IE_ENABLE_CUDA)
-  target_sources(ie_core PRIVATE src/cuda/device_check.cu)
+  target_sources(ie_core PRIVATE src/cuda/device_check.cu src/cuda/kernels.cu src/cuda/cuda_runner.cu)
   target_compile_definitions(ie_core PUBLIC IE_WITH_CUDA=1)
   target_link_libraries(ie_core PUBLIC CUDA::cudart)
   # Line info lets Nsight Compute map hot spots back to your .cu source lines.

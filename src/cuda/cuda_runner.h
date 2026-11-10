@@ -1,0 +1,23 @@
+#pragma once
+// The GPU implementation of Runner. Plain C++ header: no CUDA types, so the
+// rest of the program can include it without being compiled by nvcc.
+
+#include <memory>
+#include <string>
+
+#include "runner.h"
+
+namespace ie::cuda {
+
+// True if a CUDA device and driver are present.
+bool device_available();
+std::string device_description();
+
+// Copies the model to the GPU. `w` must hold BF16 weights; it can be freed
+// afterwards. max_tokens sets the KV cache size in VRAM.
+std::unique_ptr<Runner> make_runner(const Config& cfg, const Weights& w, int max_tokens);
+
+// Compares every CUDA kernel with the CPU reference on random data. Returns 0 if all pass.
+int run_selftest();
+
+}  // namespace ie::cuda
