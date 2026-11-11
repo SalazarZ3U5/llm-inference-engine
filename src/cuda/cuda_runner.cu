@@ -1,5 +1,6 @@
 #include "cuda/cuda_runner.h"
 
+#include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
 #include <algorithm>
@@ -143,16 +144,17 @@ struct Sequence {
 class CudaEngine final : public Runner, public BatchRunner {
  public:
   CudaEngine(const Config& cfg, const Weights& w, int max_batch, int max_seq_len, int num_pages,
-             bool use_graphs)
+             bool use_graphs, bool kv_f16)
       : cfg_(cfg), max_batch_(max_batch), max_seq_len_(max_seq_len), num_pages_(num_pages),
         max_pages_per_seq_((max_seq_len + kPageSize - 1) / kPageSize), use_graphs_(use_graphs),
-        dtype_(w.dtype), seqs_(max_batch) {
+        kv_f16_(kv_f16), dtype_(w.dtype), seqs_(max_batch) {
     if (w.dtype != DType::BF16 && w.dtype != DType::I8)
       throw std::runtime_error("the CUDA backend runs bf16 or int8 weights (not f32)");
     if (num_pages < 1) throw std::runtime_error("KV cache: no pages");
     cudaDeviceProp prop{};
     check(cudaGetDeviceProperties(&prop, 0), "cudaGetDeviceProperties");
-    name_ = std::string("cuda, ") + prop.name + (use_graphs_ ? ", graphs" : ", no graphs");
+    name_ = std::string("cuda, ") + prop.name + (use_graphs_ ? ", graphs" : ", no graphs") +
+            (kv_f16_ ? ", f16 KV cache" : "");
     check(cudaStreamCreateWithFlags(&stream_, cudaStreamNonBlocking), "cudaStreamCreate");
     init_matmul_workspace();  // before any graph is recorded
 
@@ -186,11 +188,12 @@ class CudaEngine final : public Runner, public BatchRunner {
       inv_freq[i] = 1.0f / std::pow(cfg_.rope_theta, float(2 * i) / float(cfg_.head_dim));
     inv_freq_ = mem_.upload(inv_freq);
 
-    // Paged KV cache: per layer, a pool of num_pages pages of kPageSize rows.
-    const size_t layer_floats = size_t(num_pages_) * kPageSize * cfg_.kv_dim();
-    k_pool_ = mem_.alloc<float>(layer_floats * cfg_.num_layers);
-    v_pool_ = mem_.alloc<float>(layer_floats * cfg_.num_layers);
-    kv_bytes_ = 2 * layer_floats * cfg_.num_layers * sizeof(float);
+    // Paged KV cache: per layer, a pool of num_pages pages of kPageSize rows,
+    // as FP32 or FP16 values (2 or 4 bytes each).
+    const size_t layer_bytes = size_t(num_pages_) * kPageSize * cfg_.kv_dim() * kv_elem_bytes();
+    k_pool_ = mem_.alloc<unsigned char>(layer_bytes * cfg_.num_layers);
+    v_pool_ = mem_.alloc<unsigned char>(layer_bytes * cfg_.num_layers);
+    kv_bytes_ = 2 * layer_bytes * cfg_.num_layers;
     for (int p = num_pages_ - 1; p >= 0; --p) free_pages_.push_back(p);
 
     // Page tables, one row per sequence slot, mirrored in pinned host memory.
@@ -418,15 +421,16 @@ class CudaEngine final : public Runner, public BatchRunner {
     kv.tables = tables_;
     kv.max_pages = max_pages_per_seq_;
     kv.page_size = kPageSize;
-    const size_t pool_stride = size_t(num_pages_) * kPageSize * cfg_.kv_dim();
+    kv.f16 = kv_f16_;
+    const size_t layer_bytes = size_t(num_pages_) * kPageSize * cfg_.kv_dim() * kv_elem_bytes();
 
     embedding(x_, ids_, embed_, T, stream_);
     stage("embed", x_, H);
 
     for (int l = 0; l < cfg_.num_layers; ++l) {
       const DeviceLayer& L = layers_[l];
-      float* kp = k_pool_ + l * pool_stride;
-      float* vp = v_pool_ + l * pool_stride;
+      void* kp = k_pool_ + l * layer_bytes;
+      void* vp = v_pool_ + l * layer_bytes;
 
       // attention block: x += o_proj(attention(rope(q), rope(k), v))
       rmsnorm(xn_, x_, L.input_norm, T, H, cfg_.rms_norm_eps, stream_);
@@ -540,6 +544,7 @@ class CudaEngine final : public Runner, public BatchRunner {
   Config cfg_;
   int max_batch_ = 1, max_seq_len_ = 0, num_pages_ = 0, max_pages_per_seq_ = 0;
   bool use_graphs_ = true;
+  bool kv_f16_ = false;
   DType dtype_;
   std::string name_;
   size_t weight_bytes_ = 0, num_params_ = 0, kv_bytes_ = 0;
@@ -553,7 +558,8 @@ class CudaEngine final : public Runner, public BatchRunner {
   float* inv_freq_ = nullptr;
 
   // Paged KV cache
-  float *k_pool_ = nullptr, *v_pool_ = nullptr;  // [layer][page][row][kv_dim]
+  unsigned char *k_pool_ = nullptr, *v_pool_ = nullptr;  // [layer][page][row][kv_dim], f32 or f16
+  size_t kv_elem_bytes() const { return kv_f16_ ? 2 : 4; }
   int* tables_ = nullptr;                        // [sequence][page index] -> page id
   PinnedBuffer<int> h_tables_;
   bool tables_dirty_ = true;
@@ -596,19 +602,21 @@ std::string device_description() {
 void set_tensor_cores(bool on) { ie::cuda::set_tensor_cores_impl(on); }
 
 std::unique_ptr<Runner> make_runner(const Config& cfg, const Weights& w, int max_tokens,
-                                    bool use_graphs) {
+                                    bool use_graphs, bool kv_f16) {
   return std::make_unique<CudaEngine>(cfg, w, /*max_batch=*/1, max_tokens, pages_for(max_tokens),
-                                      use_graphs);
+                                      use_graphs, kv_f16);
 }
 
 std::unique_ptr<BatchRunner> make_batch_runner(const Config& cfg, const Weights& w, int max_batch,
-                                               int max_seq_len, size_t kv_bytes, bool use_graphs) {
-  const size_t page_bytes = size_t(2) * kPageSize * cfg.kv_dim() * sizeof(float) * cfg.num_layers;
+                                               int max_seq_len, size_t kv_bytes, bool use_graphs,
+                                               bool kv_f16) {
+  const size_t page_bytes =
+      size_t(2) * kPageSize * cfg.kv_dim() * (kv_f16 ? 2 : 4) * cfg.num_layers;
   // Enough pages for the byte budget, but never more than every sequence at full length.
   const size_t want = std::max<size_t>(1, kv_bytes / page_bytes);
   const size_t most = size_t(max_batch) * pages_for(max_seq_len);
   return std::make_unique<CudaEngine>(cfg, w, max_batch, max_seq_len, int(std::min(want, most)),
-                                      use_graphs);
+                                      use_graphs, kv_f16);
 }
 
 // ---------------------------------------------------------- self-test ----
@@ -657,6 +665,24 @@ struct Tally {
     }
   }
 };
+
+// FP16 copies for testing the FP16 KV cache: the values rounded to FP16, as
+// floats (for the CPU reference) and as __half (for the GPU).
+std::vector<float> round_f16(const std::vector<float>& v) {
+  std::vector<float> r(v.size());
+  for (size_t i = 0; i < v.size(); ++i) r[i] = __half2float(__float2half_rn(v[i]));
+  return r;
+}
+std::vector<__half> to_f16(const std::vector<float>& v) {
+  std::vector<__half> r(v.size());
+  for (size_t i = 0; i < v.size(); ++i) r[i] = __float2half_rn(v[i]);
+  return r;
+}
+std::vector<float> from_f16(const std::vector<__half>& v) {
+  std::vector<float> r(v.size());
+  for (size_t i = 0; i < v.size(); ++i) r[i] = __half2float(v[i]);
+  return r;
+}
 
 // A paged cache for tests: `lens[s]` positions per sequence, pages handed out in
 // a shuffled order so that no sequence is contiguous.
@@ -849,6 +875,19 @@ int run_selftest() {
     tally.add("paged rope (queries)", download(dq, q.size()), q_ref);
     tally.add("paged rope + cache write (keys)", download(dkp, pool), kp_ref);
     tally.add("paged cache write (values)", download(dvp, pool), vp_ref, 0.0);
+
+    // The same into an FP16 cache: written rows hold the FP32 results rounded to
+    // FP16, other rows are untouched. Keys may differ by one FP16 step where the
+    // GPU's and the CPU's rotation round to different sides of a boundary.
+    kv.f16 = true;
+    __half* hkp = mem.upload(to_f16(k_pool));
+    __half* hvp = mem.upload(to_f16(v_pool));
+    rope_and_cache(mem.upload(q), dk, dv, hkp, hvp, mem.upload(inv_freq), T, mem.upload(row_pos),
+                   mem.upload(row_seq), kv, NH, NKV, HD, s);
+    tally.add("paged rope + cache write (keys, f16 cache)", from_f16(download(hkp, pool)),
+              round_f16(kp_ref), 2e-3);
+    tally.add("paged cache write (values, f16 cache)", from_f16(download(hvp, pool)),
+              round_f16(vp_ref), 0.0);
   }
 
   // Flash-decoding attention over paged caches vs the CPU on contiguous copies:
@@ -861,8 +900,10 @@ int run_selftest() {
     struct Case { std::vector<int> lens; std::vector<Row> rows; int capacity; const char* name; bool prompt = false; };
     std::vector<Case> cases;
     cases.push_back({{1}, {{0, 0}}, 1, "first token"});
-    cases.push_back({{256}, {{0, 255}}, 256, "chunk edge 255"});
-    cases.push_back({{257}, {{0, 256}}, 4096, "chunk edge 256 + empty chunks"});
+    cases.push_back({{64}, {{0, 63}}, 64, "chunk edge 63"});
+    cases.push_back({{65}, {{0, 64}}, 1000, "chunk edge 64 + empty chunks"});
+    cases.push_back({{256}, {{0, 255}}, 256, "position 255"});
+    cases.push_back({{257}, {{0, 256}}, 4096, "position 256 + empty chunks"});
     cases.push_back({{3000}, {{0, 2999}}, 3000, "long context"});
     {
       Case c{{540}, {}, 540, "prompt continuing at 500 (40 rows)", true};
@@ -886,11 +927,18 @@ int run_selftest() {
       for (int p = 0; p < 30; ++p) c.rows.push_back({1, p});
       cases.push_back(c);
     }
+    // Each case runs with an FP32 and an FP16 cache; for FP16 the cache values
+    // are rounded first and the CPU reference uses the same rounded values.
+    for (bool f16 : {false, true})
     for (const Case& c : cases) {
       TestPages pages(c.lens, rng);
       const int T = int(c.rows.size());
       const size_t pool = size_t(pages.num_pages) * pages.page_size * KVD;
       std::vector<float> k_pool = random_vec(rng, pool, 1.0f), v_pool = random_vec(rng, pool, 1.0f);
+      if (f16) {
+        k_pool = round_f16(k_pool);
+        v_pool = round_f16(v_pool);
+      }
       std::vector<float> q = random_vec(rng, size_t(T) * QD, 1.0f), want(size_t(T) * QD);
       std::vector<int> row_seq, row_pos;
       for (int t = 0; t < T; ++t) {
@@ -910,22 +958,26 @@ int run_selftest() {
       kv.tables = mem.upload(pages.tables);
       kv.max_pages = pages.max_pages;
       kv.page_size = pages.page_size;
+      kv.f16 = f16;
+      const void* dkp = f16 ? static_cast<const void*>(mem.upload(to_f16(k_pool)))
+                            : static_cast<const void*>(mem.upload(k_pool));
+      const void* dvp = f16 ? static_cast<const void*>(mem.upload(to_f16(v_pool)))
+                            : static_cast<const void*>(mem.upload(v_pool));
       const int chunks = attention_chunks(c.capacity);
       float* part_o = mem.alloc<float>(size_t(T) * NH * chunks * HD);
       float* part_ml = mem.alloc<float>(size_t(T) * NH * chunks * 2);
       float* dout = mem.alloc<float>(want.size());
-      cuda::attention(dout, mem.upload(q), mem.upload(k_pool), mem.upload(v_pool), T,
-                      mem.upload(row_pos), mem.upload(row_seq), kv, chunks, part_o, part_ml, NH,
-                      NKV, HD, s);
-      char name[64];
-      if (c.name) std::snprintf(name, sizeof(name), "%s", c.name);
-      else std::snprintf(name, sizeof(name), "prompt of %d rows", T);
+      cuda::attention(dout, mem.upload(q), dkp, dvp, T, mem.upload(row_pos), mem.upload(row_seq), kv,
+                      chunks, part_o, part_ml, NH, NKV, HD, s);
+      char name[80];
+      if (c.name) std::snprintf(name, sizeof(name), "%s%s", c.name, f16 ? " (f16 cache)" : "");
+      else std::snprintf(name, sizeof(name), "prompt of %d rows%s", T, f16 ? " (f16 cache)" : "");
       std::snprintf(what, sizeof(what), "paged attention: %s", name);
       tally.add(what, download(dout, want.size()), want);
       if (c.prompt) {
         float* dout2 = mem.alloc<float>(want.size());
-        attention_prefill(dout2, mem.upload(q), mem.upload(k_pool), mem.upload(v_pool), T,
-                          mem.upload(row_pos), mem.upload(row_seq), kv, NH, NKV, HD, s);
+        attention_prefill(dout2, mem.upload(q), dkp, dvp, T, mem.upload(row_pos), mem.upload(row_seq),
+                          kv, NH, NKV, HD, s);
         std::snprintf(what, sizeof(what), "prefill attention: %s", name);
         tally.add(what, download(dout2, want.size()), want);
       }

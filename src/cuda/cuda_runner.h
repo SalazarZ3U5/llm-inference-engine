@@ -15,15 +15,16 @@ std::string device_description();
 
 // Copies the model to the GPU. `w` must hold BF16 or INT8 weights; it can be
 // freed afterwards. max_tokens sets the KV cache size in VRAM. use_graphs:
-// record each decode step once as a CUDA graph and replay it.
+// record each decode step once as a CUDA graph and replay it. kv_f16: store the
+// KV cache as FP16 instead of FP32 (half the memory and traffic, slightly less exact).
 std::unique_ptr<Runner> make_runner(const Config& cfg, const Weights& w, int max_tokens,
-                                    bool use_graphs = true);
+                                    bool use_graphs = true, bool kv_f16 = false);
 
 // Batched serving with a paged KV cache: up to max_batch sequences of up to
 // max_seq_len tokens, sharing a page pool of about kv_bytes bytes.
 std::unique_ptr<BatchRunner> make_batch_runner(const Config& cfg, const Weights& w, int max_batch,
                                                int max_seq_len, size_t kv_bytes,
-                                               bool use_graphs = true);
+                                               bool use_graphs = true, bool kv_f16 = false);
 
 // Multi-token matmuls (prefill) use tensor cores by default; switch off to compare.
 void set_tensor_cores(bool on);

@@ -28,10 +28,13 @@ namespace ie::cuda {
 constexpr int kKvPageSize = 16;
 
 // Where each sequence's KV rows live (see above). Passed to kernels by value.
+// The cache stores FP32 values, or FP16 when f16 is set (half the memory and
+// memory traffic; FP16 keeps ~3 significant digits, and all math stays FP32).
 struct KvLayout {
   const int* tables = nullptr;  // [num_sequences * max_pages] page ids
   int max_pages = 0;            // row stride of `tables`
   int page_size = kKvPageSize;  // must equal kKvPageSize (checked at launch)
+  bool f16 = false;             // element type of k_pool / v_pool: false = float, true = __half
 };
 
 // A weight matrix in VRAM, stored as BF16 or as INT8 with one scale per row.
@@ -65,8 +68,8 @@ void gate_up_silu(float* out, const float* x, const DeviceMatrix& Wg, const Devi
 
 // Applies RoPE to q (in place) and k, then writes row t's key and value into the
 // paged cache of its sequence at its position. inv_freq: [head_dim / 2].
-//   k_pool, v_pool: this layer's page pool, [num_pages * page_size, kv_dim]
-void rope_and_cache(float* q, const float* k, const float* v, float* k_pool, float* v_pool,
+//   k_pool, v_pool: this layer's page pool, [num_pages * page_size, kv_dim], float or __half
+void rope_and_cache(float* q, const float* k, const float* v, void* k_pool, void* v_pool,
                     const float* inv_freq, int T, const int* row_pos, const int* row_seq,
                     KvLayout kv, int n_heads, int n_kv_heads, int head_dim, cudaStream_t stream);
 
@@ -78,7 +81,7 @@ void rope_and_cache(float* q, const float* k, const float* v, float* k_pool, flo
 //     see (the maximum sequence length when recording a graph; extra chunks exit).
 //   part_o: scratch [T * n_heads * num_chunks * head_dim]
 //   part_ml: scratch [T * n_heads * num_chunks * 2]
-void attention(float* out, const float* q, const float* k_pool, const float* v_pool, int T,
+void attention(float* out, const float* q, const void* k_pool, const void* v_pool, int T,
                const int* row_pos, const int* row_seq, KvLayout kv, int num_chunks,
                float* part_o, float* part_ml, int n_heads, int n_kv_heads, int head_dim,
                cudaStream_t stream);
@@ -88,7 +91,7 @@ void attention(float* out, const float* q, const float* k_pool, const float* v_p
 // a chat. Blocks share K/V tiles between 16 queries and all query heads of a KV
 // head, instead of reading the cache once per query; no scratch needed.
 bool attention_prefill_supported(int n_heads, int n_kv_heads, int head_dim);
-void attention_prefill(float* out, const float* q, const float* k_pool, const float* v_pool, int T,
+void attention_prefill(float* out, const float* q, const void* k_pool, const void* v_pool, int T,
                        const int* row_pos, const int* row_seq, KvLayout kv, int n_heads,
                        int n_kv_heads, int head_dim, cudaStream_t stream);
 

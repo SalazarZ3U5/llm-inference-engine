@@ -9,10 +9,10 @@ Target model: **Qwen2.5-0.5B-Instruct** (download needs no license approval). De
 > hand-written CUDA kernels and CUDA graphs: **213.8 tok/s decode with BF16** (211 GB/s, 97% of the
 > measured memory bandwidth) and **361.6 tok/s with INT8**, 127x the first working version, while still
 > matching Hugging Face at every layer. Prefill uses tensor cores and FlashAttention-style tiled
-> attention (**11,481 tok/s** on a 512-token prompt, **8,732 tok/s** on 4,000 tokens), and
+> attention (**13,148 tok/s** on a 512-token prompt, **9,432 tok/s** on 4,000 tokens), and
 > flash-decoding keeps decode fast at long context (**~180 tok/s after a 4,000-token prompt**). A paged
-> KV cache and continuous batching serve many requests at once: **1,976 tok/s across 64 concurrent
-> requests**, 10.6x serving them one at a time, with every request's output identical to serving it alone.
+> KV cache and continuous batching serve many requests at once: **2,346 tok/s across 64 concurrent
+> requests**, 12.2x serving them one at a time, with every request's output identical to serving it alone.
 
 ## Layout
 
@@ -173,7 +173,7 @@ CUDA and one is present.
 - [x] BF16 weights and FP32 KV cache resident in VRAM; whole forward pass on the GPU
 - [x] Own kernels: BF16 matmul (one warp per row, coalesced 16-byte loads), RMSNorm, RoPE + cache
       write, attention, fused gate/up/SiLU, residual adds fused into the matmuls
-- [x] `ie verify --device cuda` passes (30/30); `test-cuda` checks every kernel against the CPU code (756 tests, incl. paged caches)
+- [x] `ie verify --device cuda` passes (30/30); `test-cuda` checks every kernel against the CPU code (758 tests, incl. paged caches)
 - [x] CUDA graphs: each decode step (~243 kernels) recorded once and replayed with one call (+8%)
 - [x] INT8 weights on the GPU (per-row scales); perplexity identical to the CPU INT8 path (14.8453)
 - [x] Tensor-core GEMM for prefill (WMMA, 64x64 tiles): FP32 activations split into two BF16 parts
@@ -185,7 +185,10 @@ CUDA and one is present.
       softmax per chunk, exact merge; no context-length limit; works with CUDA graphs
 - [x] Prefill attention: each block shares K/V tiles between 16 prompt tokens and all 7 query heads
       of a KV head, with an online softmax (FlashAttention-style, CUDA cores): 4,000-token prefill 4.0x
-- [ ] Decode attention: one block per KV head group (read K/V once for all 7 query heads)
+- [x] Decode attention: one block per KV head and 64-position chunk, reading each K/V row once for
+      all 7 query heads (decode attention -42% at 512 tokens; -30% at 64 sequences)
+- [x] Tensor-core matmul: the next tile's loads overlap the current tile's math (two shared-memory
+      buffers, one barrier per step): prefill +15%
 - [ ] Tensor-core (WMMA) version of the prefill attention
 - [ ] INT4 weight-only quantization
 - [x] Paged KV cache: 16-token pages from a shared pool, one page table per sequence; memory follows
@@ -224,7 +227,10 @@ CUDA and one is present.
 | 2026-11-11 | GPU: profile-guided batched matmuls (split-K, 4 rows per warp) | 1766.8 | - | 64 requests: 9.4x one at a time; 16 requests 802 → 1,046 |
 | 2026-11-11 | GPU: tiled prefill attention (shared K/V tiles, online softmax), 512-token prompt | 189.2 | **11481.2** | attention 24 ms → 5.4 ms per prompt |
 | 2026-11-11 | GPU: tiled prefill attention, 4,000-token prompt | 179.9 | **8731.6** | 4.0x prefill: attention 1.53 s → 0.19 s |
-| 2026-11-11 | **GPU: same, serving 64 concurrent requests** | **1975.5** | - | 10.6x one at a time; time to first token 1.65 s → 1.24 s |
+| 2026-11-11 | GPU: same, serving 64 concurrent requests | 1975.5 | - | 10.6x one at a time; time to first token 1.65 s → 1.24 s |
+| 2026-11-11 | GPU: GQA-shared decode attention + pipelined tensor-core matmul, 512-token prompt | 186.4 | **13147.6** | decode attention 687 → 397 us per step |
+| 2026-11-11 | GPU: same, 4,000-token prompt | 180.9 | 9432.4 | |
+| 2026-11-11 | **GPU: same, serving 64 concurrent requests** | **2346.3** | - | 12.2x one at a time; 64-sequence step 16.4 → 12.9 ms |
 
 Full sweep (`ie bench --sweep`, 64-token prompt, 32 generated tokens) on a Ryzen 5 3600XT
 (6 cores / 12 threads, AVX2, dual-channel DDR4) and an RTX 4060 (8 GB):
@@ -264,14 +270,14 @@ compares every request's tokens with serving it alone.
 
 | Concurrency | Throughput tok/s | Mean time to first token | Mean latency | p95 latency | Peak KV pages | Same as one at a time |
 |------------:|-----------------:|-------------------------:|-------------:|------------:|--------------:|:---|
-| 1 | 186.5 | 32.0 s | 33.0 s | 62.2 s | 48 | 64/64 |
-| 4 | 594.2 | 9.4 s | 10.7 s | 19.7 s | 152 | 64/64 |
-| 16 | 1,104.4 | 4.2 s | 6.7 s | 10.7 s | 556 | 64/64 |
-| 32 | 1,439.3 | 2.4 s | 5.9 s | 8.2 s | 1,097 | 64/64 |
-| 64 | **1,975.5** | 1.2 s | 5.4 s | 6.1 s | 2,146 | 64/64 |
+| 1 | 192.1 | 30.9 s | 31.9 s | 60.3 s | 48 | 64/64 |
+| 4 | 605.2 | 9.3 s | 10.5 s | 19.3 s | 152 | 64/64 |
+| 16 | 1,144.7 | 4.0 s | 6.4 s | 10.3 s | 556 | 64/64 |
+| 32 | 1,645.1 | 2.0 s | 5.0 s | 7.2 s | 1,097 | 64/64 |
+| 64 | **2,346.3** | 1.1 s | 4.5 s | 5.2 s | 2,146 | 64/64 |
 
 Decode streams all the weights once per step whether it serves one sequence or 64, so throughput
-grows with the batch: 3.2x at 4, 10.6x at 64. Time to first token drops from 32 s to 1.2 s because
+grows with the batch: 3.2x at 4, 12.2x at 64. Time to first token drops from 31 s to 1.1 s because
 requests no longer queue behind each other. Prompts are prefilled on their own between decode steps
 (chunked prefill, which mixes them into decode steps, is a possible next step).
 
@@ -287,10 +293,13 @@ time by the engine's NVTX ranges (prefill, decode, batched decode). Times per fo
 
 | Phase | Time | Biggest costs |
 |-------|-----:|---------------|
-| Decode, 1 sequence, 512 context | 5.6 ms | weight matmuls 83% (~238 GB/s while running; the card's peak is 272), attention 13% |
-| Decode, 64 sequences | 16.4 ms | attention 35%, gate/up 26%, other matmuls 21%, LM head 11% |
-| Prefill, 512 tokens | 48 ms | tensor-core matmuls 84%, attention 12% (was 67 ms, attention 38%) |
-| Prefill, 4,000 tokens | 0.45 s | attention 43%, tensor-core matmuls 55% (was 1.82 s, attention 84%) |
+| Decode, 1 sequence, 512 context | 5.5 ms | weight matmuls 87% (~238 GB/s while running; the card's peak is 272), attention 9% |
+| Decode, 64 sequences | 12.9 ms | attention 32% (near the memory floor for an FP32 cache), gate/up 22%, other matmuls 24%, LM head 12% |
+| Prefill, 512 tokens | 43 ms | tensor-core matmuls 81%, attention 15% |
+| Prefill, 4,000 tokens | 0.43 s | attention 47%, tensor-core matmuls 51% |
+
+Each row is the latest profile; the history (first profile: decode at 64 sequences 23.7 ms, prefill of
+4,000 tokens 1.82 s) is in the performance log above.
 
 The first profile changed the plan. Batches of 2-31 sequences gained almost nothing from batching (each
 extra sequence added ~0.7 ms per step): the matmul kernel re-read every activation once per weight row
@@ -310,9 +319,18 @@ Attention for a 4,000-token prompt went from 1.53 s to 0.19 s (perplexity 14.777
 sums in a different order). It is used for any pass of 16+ consecutive positions of one sequence, a
 rule that depends only on the request, so batching still cannot change an output.
 
-What's left: decode attention still reads each KV head once per query head (7 times), 28% of a
-64-sequence step; and prefill is now mostly tensor-core matmuls, whose kernel doesn't overlap its
-memory loads with its math.
+Decode attention then got the same treatment: one block per KV head (instead of per query head)
+reads each cached row once for all 7 query heads, and chunks of 64 positions instead of 256 give even
+one decoding sequence enough blocks to fill the GPU (attention per step 687 → 397 us at 512 tokens).
+The tensor-core matmul now starts loading the next tile into registers before computing on the
+current one and writes it into a second shared-memory buffer, so memory latency hides behind the math
+(prefill +15%).
+
+What's left: at 64 sequences, attention reads ~0.9 GB of FP32 K/V per step, close to what the memory
+can deliver; storing the cache in 16-bit would halve that (and double how many tokens fit). Batches of
+17-31 sequences still take the CUDA-core matmul path, which is slower there than tensor cores (a
+24-sequence step takes 16 ms, a 32-sequence one 11.6 ms); it is kept below 32 because it gives
+bit-identical results to running alone.
 
 Paging is not free for a single stream: finding a position's page adds a lookup to the attention loop.
 Loading each chunk's page ids once into shared memory and keeping 4 key/value loads in flight per warp

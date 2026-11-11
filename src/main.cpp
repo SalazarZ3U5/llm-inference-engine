@@ -15,6 +15,7 @@
 //
 // Performance options: --device cpu|cuda (default: cuda if available)
 //                      --no-graph, --no-tensor-cores (CUDA, for comparisons)
+//                      --kv f32|f16 (CUDA KV cache precision, default f32)
 //                      --weights f32|bf16|int8 (default bf16)  --threads N (default: physical cores)
 //                      --kernel scalar|avx2 (default: avx2 if compiled in)
 // Sampling options: --temp T  --top-k K  --top-p P  --rep R  --seed S  --greedy
@@ -93,7 +94,7 @@ void usage() {
       "\n"
       "options: --max-tokens N  --ctx N  --temp T  --top-k K  --top-p P  --rep R  --seed S  --greedy\n"
       "         --device cpu|cuda  --weights f32|bf16|int8  --threads N  --kernel scalar|avx2\n"
-      "         --no-graph  --no-tensor-cores\n");
+      "         --no-graph  --no-tensor-cores  --kv f32|f16\n");
 }
 
 double seconds_since(Clock::time_point t0) {
@@ -169,6 +170,7 @@ struct Options {
   std::string device = "auto";  // auto = cuda if built with CUDA and a GPU is present
   bool graphs = true;            // CUDA: replay each decode step as a recorded graph
   bool tensor_cores = true;      // CUDA: tensor-core GEMM for multi-token (prefill) matmuls
+  bool kv_f16 = false;           // CUDA: KV cache as FP16 (half the memory) instead of FP32
   std::string weights = "bf16";
   int threads = 0;           // 0 = one per physical core
   std::string kernel;        // empty = default
@@ -203,6 +205,11 @@ Options parse_options(const std::vector<std::string>& args, size_t first) {
     else if (a == "--device") o.device = next();
     else if (a == "--no-graph") o.graphs = false;
     else if (a == "--no-tensor-cores") o.tensor_cores = false;
+    else if (a == "--kv") {
+      const std::string v = next();
+      if (v != "f32" && v != "f16") throw std::runtime_error("--kv must be f32 or f16");
+      o.kv_f16 = v == "f16";
+    }
     else if (a == "--threads") o.threads = std::stoi(next());
     else if (a == "--kernel") o.kernel = next();
     else if (a == "--prompt-tokens") o.prompt_tokens = std::stoi(next());
@@ -271,8 +278,10 @@ std::string resolve_device(const std::string& d) {
 
 // Loads the model onto `device` with room for `max_tokens` tokens of context.
 std::unique_ptr<ie::Runner> load_runner(const fs::path& model_dir, const std::string& device,
-                                        ie::DType dtype, int max_tokens, bool graphs = true) {
-  (void)graphs;  // only the CUDA backend uses it
+                                        ie::DType dtype, int max_tokens, bool graphs = true,
+                                        bool kv_f16 = false) {
+  (void)graphs;  // only the CUDA backend uses these
+  (void)kv_f16;
   auto t0 = Clock::now();
   ie::Config cfg = ie::load_config((model_dir / "config.json").string());
   ie::SafeTensorsFile st((model_dir / "model.safetensors").string());
@@ -282,7 +291,7 @@ std::unique_ptr<ie::Runner> load_runner(const fs::path& model_dir, const std::st
     if (dtype == ie::DType::F32)
       throw std::runtime_error("the CUDA backend runs bf16 or int8 weights (use --weights bf16 or int8)");
     ie::Weights w = ie::load_weights(st, cfg, dtype);
-    runner = ie::cuda::make_runner(cfg, w, max_tokens, graphs);  // copies to VRAM; `w` is freed here
+    runner = ie::cuda::make_runner(cfg, w, max_tokens, graphs, kv_f16);  // copies to VRAM; `w` is freed here
 #endif
   } else {
     runner = ie::make_cpu_runner(cfg, ie::load_weights(st, cfg, dtype), max_tokens);
@@ -296,7 +305,7 @@ std::unique_ptr<ie::Runner> load_runner(const fs::path& model_dir, const std::st
 std::unique_ptr<ie::Runner> load_runner(const fs::path& model_dir, const Options& o, int max_tokens) {
   apply_compute_options(o);
   return load_runner(model_dir, resolve_device(o.device), ie::parse_dtype(o.weights), max_tokens,
-                     o.graphs);
+                     o.graphs, o.kv_f16);
 }
 
 // --------------------------------------------------------- generation ----
@@ -589,7 +598,7 @@ int cmd_bench(const Options& o) {
     if (loaded != key) {
       model.reset();  // free the previous copy first
       model = load_runner(model_dir, c.device, ie::parse_dtype(c.weights),
-                          o.prompt_tokens + o.gen_tokens + 8, c.graphs);
+                          o.prompt_tokens + o.gen_tokens + 8, c.graphs, o.kv_f16);
       loaded = key;
     }
     BenchResult r = run_bench(*model, tok, o.prompt_tokens, o.gen_tokens);
@@ -768,7 +777,7 @@ int cmd_serve_bench(const Options& o) {
     ie::SafeTensorsFile st((model_dir / "model.safetensors").string());
     ie::Weights w = ie::load_weights(st, cfg, dtype);
     eng = ie::cuda::make_batch_runner(cfg, w, max_batch, longest, size_t(o.kv_gb * 1073741824.0),
-                                      o.graphs);
+                                      o.graphs, o.kv_f16);
   }
   std::fprintf(stderr, "[loaded as %s in %.1f s | %s]\n", ie::dtype_name(dtype), seconds_since(t0),
                eng->device_name().c_str());
