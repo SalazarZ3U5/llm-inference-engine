@@ -1,7 +1,11 @@
 # Reference tooling only - the engine itself never uses these.
-# CPU-only PyTorch is enough (install it first, see README):
+# CPU-only PyTorch is enough for reference.py (install it first, see README):
 #   pip install torch --index-url https://download.pytorch.org/whl/cpu
+# compare.py runs PyTorch on the GPU and draws charts, so it needs a CUDA build instead:
+#   pip install torch --index-url https://download.pytorch.org/whl/cu128
+# plus matplotlib.
 transformers
 safetensors
 numpy
 huggingface_hub
+matplotlib

@@ -5,8 +5,8 @@ It loads Hugging Face `safetensors` weights and generates text on an NVIDIA GPU.
 
 Target model: **Qwen2.5-0.5B-Instruct** (download needs no license approval). Development GPU: RTX 4060 (sm_89, 8 GB).
 
-> Status: **Phase 5 (presentation) in progress.** The whole forward pass runs on an RTX 4060 with
-> hand-written CUDA kernels and CUDA graphs: **213.8 tok/s decode with BF16** (211 GB/s, 97% of the
+> Status: **all five phases done; prefill speed is the open item.** The whole forward pass runs on
+> an RTX 4060 with hand-written CUDA kernels and CUDA graphs: **213.8 tok/s decode with BF16** (211 GB/s, 97% of the
 > measured memory bandwidth) and **361.6 tok/s with INT8**, 127x the first working version, while still
 > matching Hugging Face at every layer. Prefill uses tensor cores and FlashAttention-style tiled
 > attention (**13,148 tok/s** on a 512-token prompt, **9,432 tok/s** on 4,000 tokens), and
@@ -14,6 +14,8 @@ Target model: **Qwen2.5-0.5B-Instruct** (download needs no license approval). De
 > KV cache and continuous batching serve many requests at once: **2,346 tok/s across 64 concurrent
 > requests** (2,485 with a 16-bit KV cache), 12.2x serving them one at a time, with every request's
 > output identical to serving it alone. `ie serve` exposes it as an OpenAI-compatible HTTP server.
+> On the same GPU, decode is within 4-5% of llama.cpp and 5.7x plain PyTorch; prefill is about half
+> of llama.cpp's speed ([comparison](#compared-with-llamacpp-and-pytorch)).
 
 ## Layout
 
@@ -239,7 +241,60 @@ the model's default sampling (temperature 0.7, top-p 0.8, top-k 20): the first s
 - [x] OpenAI-compatible HTTP server with streaming (`ie serve`): chat and text completions, SSE
       streaming, stop strings; one engine thread runs continuous batching for every connection, and a
       client that disconnects frees its KV pages at once
-- [ ] Benchmarks vs llama.cpp / PyTorch on the same GPU, with charts in this README
+- [x] Benchmarks vs llama.cpp / PyTorch on the same GPU, with charts (below)
+
+## Compared with llama.cpp and PyTorch
+
+Same GPU (RTX 4060), same model, greedy decoding, 16-bit weights and KV cache everywhere:
+this engine with BF16 weights; [llama.cpp](https://github.com/ggml-org/llama.cpp) build b12292
+(CUDA, flash attention on) with Qwen's official FP16 GGUF; PyTorch + Hugging Face transformers in
+BF16 with SDPA attention (no `torch.compile`). `python scripts\compare.py --llama-dir <llama.cpp>`
+reruns everything and redraws the charts; raw numbers are in `docs/benchmarks.json`.
+
+![One request: decode and prefill tokens/s for the three engines](docs/bench_single.png)
+
+| Engine | Prefill 512 tok/s | Decode @512 tok/s | Prefill 4,000 tok/s | Decode @4,000 tok/s |
+|---|--:|--:|--:|--:|
+| this engine (BF16) | 12,890 | 201.6 | 10,249 | 188.2 |
+| llama.cpp (FP16 GGUF) | 25,059 | 209.8 | 25,550 | 197.1 |
+| PyTorch + transformers (BF16) | 13,756 | 35.3 | 20,303 | 35.5 |
+
+![Total generated tokens/s against the number of requests served at once](docs/bench_batched.png)
+
+Each request: a 512-token prompt and 128 generated tokens, all arriving together (llama.cpp's
+`llama-batched-bench` workload); total generated tokens per second, prefill included.
+
+| Engine | 1 at once | 4 at once | 16 at once | 32 at once | 64 at once |
+|---|--:|--:|--:|--:|--:|
+| this engine (BF16) | 198 | 615 | 1,115 | 1,738 | 2,141 |
+| llama.cpp (FP16 GGUF) | 183 | 655 | 1,632 | 2,154 | 2,555 |
+| PyTorch + transformers (BF16) | 33 | 128 | 489 | 893 | 1,584 |
+
+| 8-bit weights, one request | Prefill 512 tok/s | Decode @512 tok/s |
+|---|--:|--:|
+| this engine (INT8, per-row scales) | 12,166 | 327.3 |
+| llama.cpp (Q8_0) | 30,802 | 344.4 |
+
+What the numbers say:
+
+- **Decode is within 4-5% of llama.cpp** (BF16 202 vs 210 tok/s, INT8 327 vs 344) and 5.7x plain
+  PyTorch. Decoding one sequence is limited by how fast the weights stream from memory, and both
+  engines are close to that limit; PyTorch loses to the per-token Python and kernel-launch overhead
+  that CUDA graphs remove here.
+- **Prefill is about half of llama.cpp's speed** (12,890 vs 25,059 tok/s on 512 tokens; 10,249 vs
+  25,550 on 4,000). Three reasons, in order of size: every prefill matmul here runs twice on the
+  tensor cores, because activations are split into two BF16 halves to keep FP32-level accuracy
+  (llama.cpp and PyTorch round activations to 16 bits once); this engine's tensor-core GEMM is a
+  plain 64 x 64-tile WMMA kernel, against cuBLAS and llama.cpp's tuned kernels; and prefill attention
+  runs on CUDA cores, against tensor-core flash attention, which is why the gap widens at 4,000 tokens.
+- **Serving many requests follows prefill.** With one request this engine is ahead (198 vs 183
+  tok/s), at 4 it is close, and from 16 on llama.cpp leads (2,555 vs 2,141 at 64): in this workload
+  each request is mostly prompt, and at 64 requests prefilling takes about two thirds of the run.
+  Plain PyTorch is behind at every size.
+
+So the next lever is prefill: a single-pass 16-bit option for the tensor-core matmul (trading a
+little accuracy for ~2x fewer tensor-core operations, which is what the other two engines do), a
+better-tuned GEMM tile, and tensor cores in prefill attention.
 
 ## Performance log
 

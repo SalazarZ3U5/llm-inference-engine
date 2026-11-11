@@ -23,6 +23,7 @@
 //   (defaults come from the model's generation_config.json)
 // Serving options:  --requests N (default 64)  --concurrency 1,4,16,... (batch sizes to try)
 //                   --kv-gb G (KV cache budget, default 2)  --check (compare with one at a time)
+//                   --same-length (every request exactly --prompt-tokens + --gen-tokens)
 // Server options:   --host H (default 127.0.0.1)  --port N (default 8080)
 //                   --max-batch N (requests at once, default 32); --ctx, --kv-gb and the
 //                   sampling options set the defaults for requests that don't say
@@ -92,6 +93,7 @@ void usage() {
       "  ie inspect  <model.safetensors>\n"
       "  ie bench    <model_dir> [--sweep] [--prompt-tokens N] [--gen-tokens N]\n"
       "  ie serve-bench <model_dir> [--requests N] [--concurrency 1,4,16,32,64] [--kv-gb G] [--check]\n"
+      "              [--same-length]\n"
       "  ie serve    <model_dir> [--host 127.0.0.1] [--port 8080] [--max-batch 32] [--ctx N] [--kv-gb G]\n"
       "              [--kv f32|f16]\n"
       "  ie perplexity <model_dir> <text_file>\n"
@@ -188,6 +190,7 @@ struct Options {
   std::string concurrency = "1,4,16,32,64";
   double kv_gb = 2.0;
   bool check = false;
+  bool same_length = false;  // serve-bench: no spread in request lengths (to compare with other engines)
   // HTTP server
   std::string host = "127.0.0.1";
   int port = 8080;
@@ -230,6 +233,7 @@ Options parse_options(const std::vector<std::string>& args, size_t first) {
     else if (a == "--concurrency") o.concurrency = next();
     else if (a == "--kv-gb") o.kv_gb = std::stod(next());
     else if (a == "--check") o.check = true;
+    else if (a == "--same-length") o.same_length = true;
     else if (a == "--host") o.host = next();
     else if (a == "--port") o.port = std::stoi(next());
     else if (a == "--max-batch") o.max_batch = std::stoi(next());
@@ -774,10 +778,12 @@ int cmd_serve_bench(const Options& o) {
   std::vector<Request> reqs(std::max(1, o.requests));
   int longest = 0;
   for (Request& r : reqs) {
-    const int len = between(std::max(1, o.prompt_tokens / 2), std::max(1, o.prompt_tokens));
+    const int len = o.same_length ? std::max(1, o.prompt_tokens)
+                                  : between(std::max(1, o.prompt_tokens / 2), std::max(1, o.prompt_tokens));
     const int start = between(0, int(unit.size()) - 1);
     r.prompt.assign(text.begin() + start, text.begin() + start + len);
-    r.gen = between(std::max(1, o.gen_tokens / 2), std::max(1, o.gen_tokens));
+    r.gen = o.same_length ? std::max(1, o.gen_tokens)
+                          : between(std::max(1, o.gen_tokens / 2), std::max(1, o.gen_tokens));
     longest = std::max(longest, len + r.gen);
   }
 
@@ -815,7 +821,8 @@ int cmd_serve_bench(const Options& o) {
     }
   }
 
-  const int min_prompt = std::max(1, o.prompt_tokens / 2), min_gen = std::max(1, o.gen_tokens / 2);
+  const int min_prompt = o.same_length ? std::max(1, o.prompt_tokens) : std::max(1, o.prompt_tokens / 2);
+  const int min_gen = o.same_length ? std::max(1, o.gen_tokens) : std::max(1, o.gen_tokens / 2);
   std::printf("%d requests, prompts %d-%d tokens, generating %d-%d tokens each (greedy), %s weights\n",
               int(reqs.size()), min_prompt, std::max(1, o.prompt_tokens), min_gen,
               std::max(1, o.gen_tokens), ie::dtype_name(dtype));
