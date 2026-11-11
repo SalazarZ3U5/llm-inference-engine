@@ -83,6 +83,15 @@ void attention(float* out, const float* q, const float* k_pool, const float* v_p
                float* part_o, float* part_ml, int n_heads, int n_kv_heads, int head_dim,
                cudaStream_t stream);
 
+// The same attention for a prompt: T rows that are consecutive positions of
+// ONE sequence (row_pos[t] = row_pos[0] + t), e.g. a prompt or the next turn of
+// a chat. Blocks share K/V tiles between 16 queries and all query heads of a KV
+// head, instead of reading the cache once per query; no scratch needed.
+bool attention_prefill_supported(int n_heads, int n_kv_heads, int head_dim);
+void attention_prefill(float* out, const float* q, const float* k_pool, const float* v_pool, int T,
+                       const int* row_pos, const int* row_seq, KvLayout kv, int n_heads,
+                       int n_kv_heads, int head_dim, cudaStream_t stream);
+
 // Number of chunks needed to cover `context_tokens` cached positions.
 int attention_chunks(int context_tokens);
 

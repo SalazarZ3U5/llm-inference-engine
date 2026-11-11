@@ -450,6 +450,122 @@ __global__ void attention_merge_kernel(float* __restrict__ out, const float* __r
   out[size_t(t) * n_heads * head_dim + h * head_dim + d] = acc / L;
 }
 
+// ---------------------------------------------- prefill attention ----
+//
+// A prompt's T query rows each attend to every earlier position, so the
+// decode kernel above (each block reads the cache for one query) reads the K/V
+// cache T times: memory traffic grows with T^2. Here a block takes kPfQ
+// consecutive queries and all the query heads that share one KV head (7 for
+// Qwen2.5-0.5B), loads K/V kPfKeys positions at a time into shared memory, and
+// every one of those kPfQ x 7 queries uses each loaded tile: one thread per
+// (query, head), holding its query and its output in registers.
+//
+// Softmax is computed "online" (as in FlashAttention): each thread keeps the
+// running max m, the running sum l and the unnormalized output acc; when a new
+// tile raises the max, l and acc are rescaled by exp(m_old - m_new). No scores
+// are stored, and no partial results need merging.
+//
+// Rows must be consecutive positions of one sequence (a prompt, or the next
+// part of one), which is what lets a block share its K/V tiles.
+
+constexpr int kPfQ = 16;      // query tokens per block
+constexpr int kPfSlots = 8;   // threads per query token: one per query head of the group (<= 8)
+constexpr int kPfKeys = 16;   // cached positions per shared-memory tile
+constexpr int kPfDim = 64;    // head_dim this kernel is compiled for
+constexpr int kPfThreads = kPfQ * kPfSlots;  // 128
+
+__global__ void __launch_bounds__(kPfThreads)
+attention_prefill_kernel(float* __restrict__ out, const float* __restrict__ q,
+                         const float* __restrict__ k_pool, const float* __restrict__ v_pool,
+                         int T, const int* __restrict__ row_pos, const int* __restrict__ row_seq,
+                         KvLayout kv, int n_heads, int n_kv_heads, float scale) {
+  constexpr int D = kPfDim;
+  __shared__ __align__(16) float ks[kPfKeys][D];
+  __shared__ __align__(16) float vs[kPfKeys][D];
+  const int kvh = blockIdx.y, group = n_heads / n_kv_heads;
+  const int t0 = blockIdx.x * kPfQ;
+  const int qi = threadIdx.x / kPfSlots, g = threadIdx.x % kPfSlots, t = t0 + qi;
+  const bool active = g < group && t < T;
+  const int seq = row_seq[0];
+  const int max_pos = row_pos[min(t0 + kPfQ, T) - 1];  // positions increase by 1 per row
+  const int pos = active ? row_pos[t] : -1;            // inactive threads see nothing
+  const int h = kvh * group + g;
+  const int q_dim = n_heads * D, kv_dim = n_kv_heads * D;
+
+  float qr[D], acc[D];
+#pragma unroll
+  for (int c = 0; c < D / 4; ++c) {
+    float4 v = make_float4(0.f, 0.f, 0.f, 0.f);
+    if (active) v = *reinterpret_cast<const float4*>(q + size_t(t) * q_dim + h * D + 4 * c);
+    qr[4 * c + 0] = v.x * scale;  // fold 1/sqrt(head_dim) into the query once
+    qr[4 * c + 1] = v.y * scale;
+    qr[4 * c + 2] = v.z * scale;
+    qr[4 * c + 3] = v.w * scale;
+  }
+#pragma unroll
+  for (int d = 0; d < D; ++d) acc[d] = 0.0f;
+  float m = -INFINITY, l = 0.0f;
+
+  for (int s0 = 0; s0 <= max_pos; s0 += kPfKeys) {
+    __syncthreads();  // everyone is done with the previous tile
+    for (int i = threadIdx.x; i < kPfKeys * D / 4; i += kPfThreads) {
+      const int j = i / (D / 4), c = (i % (D / 4)) * 4;
+      const int sp = min(s0 + j, max_pos);  // past the end: a valid row, masked below
+      const size_t off = kv_offset(kv, seq, sp, kv_dim) + kvh * D + c;
+      *reinterpret_cast<float4*>(&ks[j][c]) = *reinterpret_cast<const float4*>(k_pool + off);
+      *reinterpret_cast<float4*>(&vs[j][c]) = *reinterpret_cast<const float4*>(v_pool + off);
+    }
+    __syncthreads();
+
+    // Scores for this tile. All threads of a warp read the same key row at the
+    // same time, which shared memory serves as a single broadcast.
+    float sc[kPfKeys];
+    float tile_max = -INFINITY;
+#pragma unroll
+    for (int j = 0; j < kPfKeys; ++j) {
+      float dot = 0.0f;
+#pragma unroll
+      for (int c = 0; c < D / 4; ++c) {
+        const float4 kk = *reinterpret_cast<const float4*>(&ks[j][4 * c]);
+        dot = fmaf(qr[4 * c + 0], kk.x, dot);
+        dot = fmaf(qr[4 * c + 1], kk.y, dot);
+        dot = fmaf(qr[4 * c + 2], kk.z, dot);
+        dot = fmaf(qr[4 * c + 3], kk.w, dot);
+      }
+      sc[j] = s0 + j <= pos ? dot : -INFINITY;  // causal mask
+      tile_max = fmaxf(tile_max, sc[j]);
+    }
+    const float m_new = fmaxf(m, tile_max);
+    if (m_new == -INFINITY) continue;  // nothing visible to this thread (inactive)
+    const float corr = expf(m - m_new);  // 0 on the first tile (m = -inf)
+    l *= corr;
+#pragma unroll
+    for (int d = 0; d < D; ++d) acc[d] *= corr;
+#pragma unroll
+    for (int j = 0; j < kPfKeys; ++j) {
+      const float p = expf(sc[j] - m_new);  // masked: exp(-inf) = 0
+      l += p;
+#pragma unroll
+      for (int c = 0; c < D / 4; ++c) {
+        const float4 vv = *reinterpret_cast<const float4*>(&vs[j][4 * c]);
+        acc[4 * c + 0] = fmaf(p, vv.x, acc[4 * c + 0]);
+        acc[4 * c + 1] = fmaf(p, vv.y, acc[4 * c + 1]);
+        acc[4 * c + 2] = fmaf(p, vv.z, acc[4 * c + 2]);
+        acc[4 * c + 3] = fmaf(p, vv.w, acc[4 * c + 3]);
+      }
+    }
+    m = m_new;
+  }
+
+  if (!active) return;
+  const float inv_l = 1.0f / l;
+  float* o = out + size_t(t) * q_dim + h * D;
+#pragma unroll
+  for (int c = 0; c < D / 4; ++c)
+    *reinterpret_cast<float4*>(o + 4 * c) =
+        make_float4(acc[4 * c] * inv_l, acc[4 * c + 1] * inv_l, acc[4 * c + 2] * inv_l, acc[4 * c + 3] * inv_l);
+}
+
 __global__ void gather_rows_kernel(float* __restrict__ dst, const float* __restrict__ src,
                                    const int* __restrict__ rows, int dim) {
   const float* in = src + size_t(rows[blockIdx.x]) * dim;
@@ -831,6 +947,23 @@ void rope_and_cache(float* q, const float* k, const float* v, float* k_pool, flo
   rope_cache_kernel<<<T, threads, 0, stream>>>(q, k, v, k_pool, v_pool, inv_freq, row_pos, row_seq,
                                                kv, n_heads, n_kv_heads, head_dim);
   check_launch("rope_and_cache");
+}
+
+bool attention_prefill_supported(int n_heads, int n_kv_heads, int head_dim) {
+  return head_dim == kPfDim && n_kv_heads > 0 && n_heads % n_kv_heads == 0 &&
+         n_heads / n_kv_heads <= kPfSlots;
+}
+
+void attention_prefill(float* out, const float* q, const float* k_pool, const float* v_pool, int T,
+                       const int* row_pos, const int* row_seq, KvLayout kv, int n_heads,
+                       int n_kv_heads, int head_dim, cudaStream_t stream) {
+  if (!attention_prefill_supported(n_heads, n_kv_heads, head_dim))
+    throw std::runtime_error("attention_prefill: needs head_dim 64 and at most 8 query heads per KV head");
+  if (kv.page_size != kKvPageSize) throw std::runtime_error("attention_prefill: KV page size must be 16");
+  const dim3 grid((T + kPfQ - 1) / kPfQ, n_kv_heads);
+  attention_prefill_kernel<<<grid, kPfThreads, 0, stream>>>(out, q, k_pool, v_pool, T, row_pos, row_seq, kv,
+                                                            n_heads, n_kv_heads, 1.0f / sqrtf(float(head_dim)));
+  check_launch("attention_prefill");
 }
 
 int attention_chunks(int context_tokens) { return (context_tokens + kAttnChunk - 1) / kAttnChunk; }

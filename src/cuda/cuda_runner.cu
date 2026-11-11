@@ -34,6 +34,7 @@ namespace ie::cuda {
 namespace {
 
 constexpr int kPageSize = kKvPageSize;  // tokens per KV-cache page (16)
+constexpr int kPromptMinRows = 16;      // prompts this long use the prefill attention kernel
 
 struct NvtxRange {
   explicit NvtxRange(const char* name) { IE_NVTX_PUSH(name); }
@@ -350,9 +351,16 @@ class CudaEngine final : public Runner, public BatchRunner {
       max_pos = std::max(max_pos, rows_pos[t]);
     }
     graph = graph && use_graphs_ && !on_stage;
-    // Attention chunks: a recorded graph must cover any position a sequence can
-    // reach; a direct launch only needs the context it actually has.
-    const int chunks = attention_chunks(graph ? max_seq_len_ : max_pos + 1);
+    // A prompt (16+ consecutive positions of one sequence) uses the prefill
+    // attention kernel, signalled to enqueue() by chunks = 0. The choice depends
+    // only on the request itself, never on what it is batched with.
+    bool prompt = !graph && T >= kPromptMinRows &&
+                  attention_prefill_supported(cfg_.num_heads, cfg_.num_kv_heads, cfg_.head_dim);
+    for (int t = 1; prompt && t < T; ++t)
+      prompt = rows_seq[t] == rows_seq[0] && rows_pos[t] == rows_pos[0] + t;
+    // Otherwise, attention chunks: a recorded graph must cover any position a
+    // sequence can reach; a direct launch only needs the context it actually has.
+    const int chunks = prompt ? 0 : attention_chunks(graph ? max_seq_len_ : max_pos + 1);
     reserve(T, R, chunks);  // before any capture: no allocations allowed inside a graph
     if (graph && !graphs_.count(T)) capture_graph(T, chunks);
 
@@ -426,8 +434,11 @@ class CudaEngine final : public Runner, public BatchRunner {
       matmul(k_, xn_, L.wk, L.bk, T, false, stream_);
       matmul(v_, xn_, L.wv, L.bv, T, false, stream_);
       rope_and_cache(q_, k_, v_, kp, vp, inv_freq_, T, row_pos_, row_seq_, kv, NH, NKV, HD, stream_);
-      attention(attn_, q_, kp, vp, T, row_pos_, row_seq_, kv, chunks, part_o_, part_ml_, NH, NKV, HD,
-                stream_);
+      if (chunks == 0)  // a prompt: queries share K/V tiles
+        attention_prefill(attn_, q_, kp, vp, T, row_pos_, row_seq_, kv, NH, NKV, HD, stream_);
+      else
+        attention(attn_, q_, kp, vp, T, row_pos_, row_seq_, kv, chunks, part_o_, part_ml_, NH, NKV,
+                  HD, stream_);
       matmul(x_, attn_, L.wo, nullptr, T, /*accumulate=*/true, stream_);
 
       // MLP block: x += down(silu(gate(xn)) * up(xn))
@@ -845,15 +856,27 @@ int run_selftest() {
   // (256), long context, and extra empty chunks as when replaying a graph.
   {
     struct Row { int seq, pos; };
-    struct Case { std::vector<int> lens; std::vector<Row> rows; int capacity; const char* name; };
+    // prompt: rows are consecutive positions of one sequence, so the prefill
+    // kernel can run them too (both kernels are checked).
+    struct Case { std::vector<int> lens; std::vector<Row> rows; int capacity; const char* name; bool prompt = false; };
     std::vector<Case> cases;
     cases.push_back({{1}, {{0, 0}}, 1, "first token"});
     cases.push_back({{256}, {{0, 255}}, 256, "chunk edge 255"});
     cases.push_back({{257}, {{0, 256}}, 4096, "chunk edge 256 + empty chunks"});
     cases.push_back({{3000}, {{0, 2999}}, 3000, "long context"});
     {
-      Case c{{540}, {}, 540, "prefill 40 rows at 500"};
+      Case c{{540}, {}, 540, "prompt continuing at 500 (40 rows)", true};
       for (int p = 500; p < 540; ++p) c.rows.push_back({0, p});
+      cases.push_back(c);
+    }
+    for (int len : {1, 17, 300, 1000}) {  // whole prompts from position 0
+      Case c{{len}, {}, len, nullptr, true};
+      for (int p = 0; p < len; ++p) c.rows.push_back({0, p});
+      cases.push_back(c);
+    }
+    {
+      Case c{{100, 300}, {}, 300, "prompt of the 2nd of 2 sequences (300 rows)", true};
+      for (int p = 0; p < 300; ++p) c.rows.push_back({1, p});
       cases.push_back(c);
     }
     cases.push_back({{6, 17, 256, 257, 3000}, {{0, 5}, {1, 16}, {2, 255}, {3, 256}, {4, 2999}}, 4096,
@@ -894,8 +917,18 @@ int run_selftest() {
       cuda::attention(dout, mem.upload(q), mem.upload(k_pool), mem.upload(v_pool), T,
                       mem.upload(row_pos), mem.upload(row_seq), kv, chunks, part_o, part_ml, NH,
                       NKV, HD, s);
-      std::snprintf(what, sizeof(what), "paged attention: %s", c.name);
+      char name[64];
+      if (c.name) std::snprintf(name, sizeof(name), "%s", c.name);
+      else std::snprintf(name, sizeof(name), "prompt of %d rows", T);
+      std::snprintf(what, sizeof(what), "paged attention: %s", name);
       tally.add(what, download(dout, want.size()), want);
+      if (c.prompt) {
+        float* dout2 = mem.alloc<float>(want.size());
+        attention_prefill(dout2, mem.upload(q), mem.upload(k_pool), mem.upload(v_pool), T,
+                          mem.upload(row_pos), mem.upload(row_seq), kv, NH, NKV, HD, s);
+        std::snprintf(what, sizeof(what), "prefill attention: %s", name);
+        tally.add(what, download(dout2, want.size()), want);
+      }
     }
   }
 
