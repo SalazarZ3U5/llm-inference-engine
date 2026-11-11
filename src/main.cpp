@@ -16,6 +16,7 @@
 //
 // Performance options: --device cpu|cuda (default: cuda if available)
 //                      --no-graph, --no-tensor-cores (CUDA, for comparisons)
+//                      --tc-fp16 (CUDA: tensor-core matmuls in one FP16 pass, ~2x faster prefill)
 //                      --kv f32|f16 (CUDA KV cache precision, default f32)
 //                      --weights f32|bf16|int8 (default bf16)  --threads N (default: physical cores)
 //                      --kernel scalar|avx2 (default: avx2 if compiled in)
@@ -103,7 +104,7 @@ void usage() {
       "\n"
       "options: --max-tokens N  --ctx N  --temp T  --top-k K  --top-p P  --rep R  --seed S  --greedy\n"
       "         --device cpu|cuda  --weights f32|bf16|int8  --threads N  --kernel scalar|avx2\n"
-      "         --no-graph  --no-tensor-cores  --kv f32|f16\n");
+      "         --no-graph  --no-tensor-cores  --tc-fp16  --kv f32|f16\n");
 }
 
 double seconds_since(Clock::time_point t0) {
@@ -179,6 +180,7 @@ struct Options {
   std::string device = "auto";  // auto = cuda if built with CUDA and a GPU is present
   bool graphs = true;            // CUDA: replay each decode step as a recorded graph
   bool tensor_cores = true;      // CUDA: tensor-core GEMM for multi-token (prefill) matmuls
+  bool tc_fp16 = false;          // CUDA: those matmuls in one FP16 pass instead of the exact BF16 split
   bool kv_f16 = false;           // CUDA: KV cache as FP16 (half the memory) instead of FP32
   std::string weights = "bf16";
   int threads = 0;           // 0 = one per physical core
@@ -219,6 +221,7 @@ Options parse_options(const std::vector<std::string>& args, size_t first) {
     else if (a == "--device") o.device = next();
     else if (a == "--no-graph") o.graphs = false;
     else if (a == "--no-tensor-cores") o.tensor_cores = false;
+    else if (a == "--tc-fp16") o.tc_fp16 = true;
     else if (a == "--kv") {
       const std::string v = next();
       if (v != "f32" && v != "f16") throw std::runtime_error("--kv must be f32 or f16");
@@ -275,6 +278,9 @@ void apply_compute_options(const Options& o) {
   ie::set_num_threads(o.threads);  // <= 0: one per physical core
   if (!o.kernel.empty()) ie::set_kernel(ie::parse_kernel(o.kernel));
   set_tensor_cores(o.tensor_cores);
+#ifdef IE_WITH_CUDA
+  ie::cuda::set_tc_fp16(o.tc_fp16);
+#endif
 }
 
 bool cuda_available() {
@@ -622,7 +628,7 @@ int cmd_bench(const Options& o) {
     BenchResult r = run_bench(*model, tok, o.prompt_tokens, o.gen_tokens);
     const bool gpu = c.device == "cuda";
     std::printf("| %s | %s | %s | %s | %.1f | %.1f | %.1f |\n", c.device.c_str(), c.weights.c_str(),
-                gpu ? (std::string("cuda") + (c.graphs ? " graph" : "") + (c.tensor_cores ? " + tc" : "")).c_str()
+                gpu ? (std::string("cuda") + (c.graphs ? " graph" : "") + (c.tensor_cores ? (o.tc_fp16 ? " + tc fp16" : " + tc") : "")).c_str()
                     : ie::kernel_name(c.kernel),
                 gpu ? "-" : std::to_string(c.threads).c_str(), r.prefill_tps, r.decode_tps, r.gbps);
     std::fflush(stdout);

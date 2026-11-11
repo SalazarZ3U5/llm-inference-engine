@@ -600,6 +600,7 @@ std::string device_description() {
 }
 
 void set_tensor_cores(bool on) { ie::cuda::set_tensor_cores_impl(on); }
+void set_tc_fp16(bool on) { ie::cuda::set_tc_fp16_impl(on); }
 
 std::unique_ptr<Runner> make_runner(const Config& cfg, const Weights& w, int max_tokens,
                                     bool use_graphs, bool kv_f16) {
@@ -725,13 +726,15 @@ int run_selftest() {
   // small shapes there split K across blocks, and 3200 x 96 has enough output
   // tiles (50 at 64 rows) to run unsplit.
   struct Shape { int rows, cols; };
-  for (bool tc : {false, true})
+  for (int mode : {0, 1, 2})  // CUDA cores; tensor cores, exact BF16 split; tensor cores, one FP16 pass
   for (DType dt : {DType::BF16, DType::I8}) {
-    set_tensor_cores_impl(tc);
+    set_tensor_cores_impl(mode > 0);
+    set_tc_fp16_impl(mode == 2);
     const char* dn = dtype_name(dt);
-    const char* path = tc ? "tc" : "cuda-core";
-    // Split-BF16 tensor-core results are within ~1e-5 of FP32; allow a little more.
-    const double tol = tc ? 1e-4 : 2e-5;
+    const char* path = mode == 0 ? "cuda-core" : mode == 1 ? "tc" : "tc-fp16";
+    // Split-BF16 tensor-core results are within ~1e-5 of FP32; one FP16 pass
+    // rounds every activation to 11 significant bits (~2.4e-4 relative).
+    const double tol = mode == 0 ? 2e-5 : mode == 1 ? 1e-4 : 2e-3;
     for (Shape sh : {Shape{37, 72}, Shape{37, 75}, Shape{128, 896}, Shape{300, 896}, Shape{64, 4864}, Shape{3200, 96}}) {
       Matrix m = make_matrix(random_vec(rng, size_t(sh.rows) * sh.cols, 0.1f), sh.rows, sh.cols, dt);
       Matrix m2 = make_matrix(random_vec(rng, size_t(sh.rows) * sh.cols, 0.1f), sh.rows, sh.cols, dt);
@@ -782,6 +785,7 @@ int run_selftest() {
     tally.add(what, download(dx, want.size()), want, 0.0);
   }
   set_tensor_cores_impl(true);
+  set_tc_fp16_impl(false);
 
   // Batching must not change results: on the CUDA-core path (batches under 32),
   // a token computed in a batch must equal the same token computed alone, bit

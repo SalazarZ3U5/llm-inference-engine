@@ -721,11 +721,18 @@ __device__ __forceinline__ void tc_fetch(TcFetch<W>& f, const float* __restrict_
     }
 }
 
-// x is split into two BF16 parts, x = hi + lo (see above); BF16 weights are
-// copied as they are, INT8 weights converted exactly to BF16.
-template <class W, int kNumB>
-__device__ __forceinline__ void tc_store(const TcFetch<W>& f, __nv_bfloat16* a_hi,
-                                         __nv_bfloat16* a_lo, __nv_bfloat16* const (&b_tile)[2]) {
+// Tile element: BF16 for the exact two-pass mode, FP16 for the single pass.
+__device__ __forceinline__ void to_tile(__nv_bfloat16& d, float v) { d = __float2bfloat16_rn(v); }
+__device__ __forceinline__ void to_tile(__half& d, float v) { d = __float2half_rn(v); }
+
+// kSplit (exact, BF16 tiles): x is split into two BF16 parts, x = hi + lo (see
+// above); BF16 weights are copied as they are, INT8 weights converted exactly.
+// !kSplit (fast, FP16 tiles): x is rounded to FP16 once (11 significant bits
+// against BF16's 8), BF16 and INT8 weights convert to FP16 (exact for this
+// model's weights); a_lo is not used.
+template <class W, int kNumB, bool kSplit, class TE>
+__device__ __forceinline__ void tc_store(const TcFetch<W>& f, TE* a_hi, TE* a_lo,
+                                         TE* const (&b_tile)[2]) {
 #pragma unroll
   for (int i = 0; i < kAPerThread; ++i) {
     const int idx = threadIdx.x + i * kTcThreads;
@@ -733,9 +740,13 @@ __device__ __forceinline__ void tc_store(const TcFetch<W>& f, __nv_bfloat16* a_h
     const float vals[4] = {f.a[i].x, f.a[i].y, f.a[i].z, f.a[i].w};
 #pragma unroll
     for (int j = 0; j < 4; ++j) {
-      const __nv_bfloat16 hi = __float2bfloat16_rn(vals[j]);
-      a_hi[m * kLd + c + j] = hi;
-      a_lo[m * kLd + c + j] = __float2bfloat16_rn(vals[j] - __bfloat162float(hi));
+      if constexpr (kSplit) {
+        const __nv_bfloat16 hi = __float2bfloat16_rn(vals[j]);
+        a_hi[m * kLd + c + j] = hi;
+        a_lo[m * kLd + c + j] = __float2bfloat16_rn(vals[j] - __bfloat162float(hi));
+      } else {
+        to_tile(a_hi[m * kLd + c + j], vals[j]);
+      }
     }
   }
   constexpr int P = TcFetch<W>::kPerLoad;
@@ -745,36 +756,38 @@ __device__ __forceinline__ void tc_store(const TcFetch<W>& f, __nv_bfloat16* a_h
     for (int i = 0; i < TcFetch<W>::kBPerThread; ++i) {
       const int idx = threadIdx.x + i * kTcThreads;
       const int n = idx / (kTileK / P), c = (idx % (kTileK / P)) * P;
-      if constexpr (!W::kScaled) {
+      if constexpr (!W::kScaled && kSplit) {  // BF16 weights into BF16 tiles: a plain copy
         *reinterpret_cast<uint4*>(b_tile[b] + n * kLd + c) = f.b[b][i];
       } else {
-        float w[16];
+        float w[P];
         W::unpack(f.b[b][i], w);
 #pragma unroll
-        for (int j = 0; j < 16; ++j) b_tile[b][n * kLd + c + j] = __float2bfloat16_rn(w[j]);
+        for (int j = 0; j < P; ++j) to_tile(b_tile[b][n * kLd + c + j], w[j]);
       }
     }
 }
 
 // kGateUp = false: y[t, n] (+)= (x·W^T)[t, n] * scale[n] + bias[n]
 // kGateUp = true:  y[t, n]   = silu((x·Wg^T)[t, n] * sg[n]) * (x·Wu^T)[t, n] * su[n]
-template <class W, bool kGateUp>
+template <class W, bool kGateUp, bool kSplit>
 __global__ void __launch_bounds__(kTcThreads, 3)
 tc_gemm_kernel(float* __restrict__ y, const float* __restrict__ x,
                const typename W::Elem* __restrict__ W0, const float* __restrict__ s0,
                const typename W::Elem* __restrict__ W1, const float* __restrict__ s1,
                const float* __restrict__ bias, int T, int N, int K, bool accumulate,
                int k_split, float* __restrict__ partial) {
+  using TE = std::conditional_t<kSplit, __nv_bfloat16, __half>;  // tile element
   constexpr int kNumB = kGateUp ? 2 : 1;
-  constexpr int kStageBytes = (2 + kNumB) * kTileBytes;   // A hi, A lo, B tile(s)
+  constexpr int kNumA = kSplit ? 2 : 1;                     // A hi (+ A lo)
+  constexpr int kStageBytes = (kNumA + kNumB) * kTileBytes;
   constexpr int kMainBytes = 2 * kStageBytes;              // two stages: compute one, fill the other
   constexpr int kEpiBytes = kNumB * kTileM * kLdC * 4;     // FP32 output tile(s)
   __shared__ __align__(128) unsigned char smem[kMainBytes > kEpiBytes ? kMainBytes : kEpiBytes];
-  auto a_hi = [&](int st) { return reinterpret_cast<__nv_bfloat16*>(smem + st * kStageBytes); };
-  auto a_lo = [&](int st) { return reinterpret_cast<__nv_bfloat16*>(smem + st * kStageBytes + kTileBytes); };
-  auto b_tiles = [&](int st, __nv_bfloat16* (&out)[2]) {
+  auto a_hi = [&](int st) { return reinterpret_cast<TE*>(smem + st * kStageBytes); };
+  auto a_lo = [&](int st) { return reinterpret_cast<TE*>(smem + st * kStageBytes + kTileBytes); };
+  auto b_tiles = [&](int st, TE* (&out)[2]) {
     for (int b = 0; b < 2; ++b)
-      out[b] = reinterpret_cast<__nv_bfloat16*>(smem + st * kStageBytes + (2 + (b < kNumB ? b : 0)) * kTileBytes);
+      out[b] = reinterpret_cast<TE*>(smem + st * kStageBytes + (kNumA + (b < kNumB ? b : 0)) * kTileBytes);
   };
 
   const int n0 = blockIdx.x * kTileN, m0 = blockIdx.y * kTileM;
@@ -793,37 +806,39 @@ tc_gemm_kernel(float* __restrict__ y, const float* __restrict__ x,
   const int k_begin = blockIdx.z * k_split, k_end = min(K, k_begin + k_split);
   TcFetch<W> f;
   {
-    __nv_bfloat16* bt[2];
+    TE* bt[2];
     b_tiles(0, bt);
     tc_fetch<W, kNumB>(f, x, mats, T, N, K, m0, n0, k_begin);
-    tc_store<W, kNumB>(f, a_hi(0), a_lo(0), bt);
+    tc_store<W, kNumB, kSplit>(f, a_hi(0), a_lo(0), bt);
   }
   __syncthreads();
   int st = 0;
   for (int k0 = k_begin; k0 < k_end; k0 += kTileK) {
     const bool more = k0 + kTileK < k_end;
     if (more) tc_fetch<W, kNumB>(f, x, mats, T, N, K, m0, n0, k0 + kTileK);  // in flight during the MMAs
-    __nv_bfloat16* bt[2];
+    TE* bt[2];
     b_tiles(st, bt);
 #pragma unroll
     for (int kk = 0; kk < kTileK; kk += 16) {
-      wmma::fragment<wmma::matrix_a, 16, 16, 16, __nv_bfloat16, wmma::row_major> ahi[2], alo[2];
+      wmma::fragment<wmma::matrix_a, 16, 16, 16, TE, wmma::row_major> ahi[2], alo[2];
+      (void)alo;  // only the two-pass (kSplit) variant uses the low parts
 #pragma unroll
       for (int i = 0; i < 2; ++i) {
         wmma::load_matrix_sync(ahi[i], a_hi(st) + (wm * 32 + i * 16) * kLd + kk, kLd);
-        wmma::load_matrix_sync(alo[i], a_lo(st) + (wm * 32 + i * 16) * kLd + kk, kLd);
+        if constexpr (kSplit)
+          wmma::load_matrix_sync(alo[i], a_lo(st) + (wm * 32 + i * 16) * kLd + kk, kLd);
       }
 #pragma unroll
       for (int b = 0; b < kNumB; ++b) {
 #pragma unroll
         for (int j = 0; j < 2; ++j) {
           // B is stored [n][k], i.e. column-major as a K x N matrix.
-          wmma::fragment<wmma::matrix_b, 16, 16, 16, __nv_bfloat16, wmma::col_major> bf;
+          wmma::fragment<wmma::matrix_b, 16, 16, 16, TE, wmma::col_major> bf;
           wmma::load_matrix_sync(bf, bt[b] + (wn * 32 + j * 16) * kLd + kk, kLd);
 #pragma unroll
           for (int i = 0; i < 2; ++i) {
             wmma::mma_sync(acc[b][i][j], ahi[i], bf, acc[b][i][j]);
-            wmma::mma_sync(acc[b][i][j], alo[i], bf, acc[b][i][j]);
+            if constexpr (kSplit) wmma::mma_sync(acc[b][i][j], alo[i], bf, acc[b][i][j]);
           }
         }
       }
@@ -831,9 +846,9 @@ tc_gemm_kernel(float* __restrict__ y, const float* __restrict__ x,
     if (more) {
       // The other stage was last read in the previous step, which every thread
       // finished before that step's barrier.
-      __nv_bfloat16* nb[2];
+      TE* nb[2];
       b_tiles(st ^ 1, nb);
-      tc_store<W, kNumB>(f, a_hi(st ^ 1), a_lo(st ^ 1), nb);
+      tc_store<W, kNumB, kSplit>(f, a_hi(st ^ 1), a_lo(st ^ 1), nb);
     }
     __syncthreads();  // the new stage is complete, and nobody still reads the old one
     st ^= 1;
@@ -905,6 +920,7 @@ size_t g_splitk_floats = 0;
 int g_num_sms = 0;
 
 bool g_tensor_cores = true;
+bool g_tc_fp16 = false;  // tensor-core matmuls: one FP16 pass instead of the exact BF16 split
 
 // Tensor cores for prefill-sized calls. Below 32 rows (decode, small batches) the
 // 64-row tiles would be mostly empty and a 896-row matrix would make only 14
@@ -943,7 +959,8 @@ void launch_tc(float* y, const float* x, const DeviceMatrix& A, const DeviceMatr
   const int splits = (K + k_split - 1) / k_split;
   grid.z = splits;
   using E = typename W::Elem;
-  tc_gemm_kernel<W, kGateUp><<<grid, kTcThreads, 0, stream>>>(
+  auto kernel = g_tc_fp16 ? tc_gemm_kernel<W, kGateUp, false> : tc_gemm_kernel<W, kGateUp, true>;
+  kernel<<<grid, kTcThreads, 0, stream>>>(
       y, x, static_cast<const E*>(A.data), A.scale, B ? static_cast<const E*>(B->data) : nullptr,
       B ? B->scale : nullptr, bias, T, N, K, accumulate, k_split, splits > 1 ? g_splitk_ws : nullptr);
   if (splits > 1) {
@@ -1010,6 +1027,8 @@ void rmsnorm(float* y, const float* x, const float* weight, int T, int dim, floa
 }
 
 void set_tensor_cores_impl(bool on) { g_tensor_cores = on; }
+void set_tc_fp16_impl(bool on) { g_tc_fp16 = on; }
+bool tc_fp16() { return g_tc_fp16; }
 
 void init_matmul_workspace() {
   if (g_splitk_ws) return;

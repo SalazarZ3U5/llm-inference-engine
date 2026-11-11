@@ -12,7 +12,9 @@ Workloads (greedy decoding, every engine on the GPU, 16-bit weights and KV cache
   - 8-bit weights, one request: this engine's INT8 vs llama.cpp's Q8_0
 
 Engines:
-  - this engine: `ie bench` and `ie serve-bench --same-length`, BF16 weights, FP16 KV cache
+  - this engine: `ie bench` and `ie serve-bench --same-length`, BF16 weights, FP16 KV cache,
+    twice: with its default exact tensor-core matmuls (two BF16 passes) and with --tc-fp16
+    (one FP16 pass, as the other two engines do)
   - llama.cpp: a prebuilt CUDA release (llama-bench, llama-batched-bench), the official
     FP16 and Q8_0 GGUF files (downloaded into models/gguf once), flash attention on
   - PyTorch: Hugging Face transformers, BF16, SDPA attention, no torch.compile
@@ -42,9 +44,14 @@ BATCH_PROMPT = 512
 GGUF_REPO = "Qwen/Qwen2.5-0.5B-Instruct-GGUF"
 GGUF_FILES = {"f16": "qwen2.5-0.5b-instruct-fp16.gguf", "q8_0": "qwen2.5-0.5b-instruct-q8_0.gguf"}
 
-ENGINES = ["this engine", "llama.cpp", "PyTorch"]
+ENGINES = ["this engine", "this engine, FP16 tc", "llama.cpp", "PyTorch"]  # table order
+# Chart order: neighbouring bars must be easy to tell apart (orange and yellow side by side
+# fail the palette check), so the FP16 variant goes last, next to aqua.
+CHART_ORDER = ["this engine", "llama.cpp", "PyTorch", "this engine, FP16 tc"]
+IE_VARIANTS = {"this engine": [], "this engine, FP16 tc": ["--tc-fp16"]}
 LABELS = {  # what each engine runs, for the tables
     "this engine": "this engine (BF16)",
+    "this engine, FP16 tc": "this engine (BF16, --tc-fp16)",
     "llama.cpp": "llama.cpp (FP16 GGUF)",
     "PyTorch": "PyTorch + transformers (BF16)",
 }
@@ -88,26 +95,26 @@ def table_rows(text, first_cell):
 
 
 def bench_ie(ie, model, out):
-    single = out.setdefault("single", {}).setdefault("this engine", {})
-    for p in PROMPTS:
-        text = run([ie, "bench", model, "--device", "cuda", "--weights", "bf16", "--kv", "f16",
-                    "--prompt-tokens", p, "--gen-tokens", GEN])
-        cells = table_rows(text, "cuda")[-1]  # | cuda | bf16 | kernel | - | prefill | decode | GB/s |
-        single[f"prefill_{p}"] = float(cells[4])
-        single[f"decode_{p}"] = float(cells[5])
+    for name, extra in IE_VARIANTS.items():
+        single = out.setdefault("single", {}).setdefault(name, {})
+        for p in PROMPTS:
+            text = run([ie, "bench", model, "--device", "cuda", "--weights", "bf16", "--kv", "f16",
+                        "--prompt-tokens", p, "--gen-tokens", GEN, *extra])
+            cells = table_rows(text, "cuda")[-1]  # | cuda | bf16 | kernel | - | prefill | decode | GB/s |
+            single[f"prefill_{p}"] = float(cells[4])
+            single[f"decode_{p}"] = float(cells[5])
+        batched = out.setdefault("batched", {}).setdefault(name, {})
+        for b in BATCHES:
+            text = run([ie, "serve-bench", model, "--same-length", "--kv", "f16",
+                        "--prompt-tokens", BATCH_PROMPT, "--gen-tokens", GEN,
+                        "--requests", b, "--concurrency", b, *extra])
+            cells = table_rows(text, str(b))[-1]  # | concurrency | peak | steps | time | tok/s | ...
+            batched[str(b)] = float(cells[4])
     text = run([ie, "bench", model, "--device", "cuda", "--weights", "int8", "--kv", "f16",
                 "--prompt-tokens", BATCH_PROMPT, "--gen-tokens", GEN])
     cells = table_rows(text, "cuda")[-1]
     out.setdefault("eight_bit", {})["this engine (INT8)"] = {
         "prefill_512": float(cells[4]), "decode_512": float(cells[5])}
-
-    batched = out.setdefault("batched", {}).setdefault("this engine", {})
-    for b in BATCHES:
-        text = run([ie, "serve-bench", model, "--same-length", "--kv", "f16",
-                    "--prompt-tokens", BATCH_PROMPT, "--gen-tokens", GEN,
-                    "--requests", b, "--concurrency", b])
-        cells = table_rows(text, str(b))[-1]  # | concurrency | peak | steps | time | tok/s | ...
-        batched[str(b)] = float(cells[4])
 
 
 # ---------------------------------------------------------------- llama.cpp --
@@ -257,7 +264,8 @@ def tables(r):
 
 
 # Reference categorical palette, slots 1-3 in fixed order; text in ink colors, never series colors.
-COLORS = {"this engine": "#2a78d6", "llama.cpp": "#eb6834", "PyTorch": "#1baf7a"}
+COLORS = {"this engine": "#2a78d6", "llama.cpp": "#eb6834", "PyTorch": "#1baf7a",
+          "this engine, FP16 tc": "#eda100"}
 SURFACE, INK, INK_2, GRID = "#fcfcfb", "#0b0b0b", "#52514e", "#e4e3df"
 
 
@@ -283,7 +291,7 @@ def charts(r):
 
     # One request: decode and prefill, two context lengths, one bar per engine.
     s = r.get("single", {})
-    engines = [e for e in ENGINES if e in s]
+    engines = [e for e in CHART_ORDER if e in s]
     if engines:
         fig, axes = plt.subplots(1, 2, figsize=(10, 4.2), facecolor=SURFACE)
         for ax, (metric, title) in zip(axes, [("decode", "Decode, one request (tokens/s)"),
@@ -303,7 +311,8 @@ def charts(r):
             ax.yaxis.set_major_formatter(thousands)
             ax.set_title(title, loc="left", fontsize=11, color=INK)
         handles, labels = axes[0].get_legend_handles_labels()
-        fig.legend(handles, labels, frameon=False, loc="lower center", ncol=len(engines))
+        fig.legend(handles, labels, frameon=False, loc="lower center", ncol=min(len(engines), 4),
+                   fontsize=9)
         fig.suptitle(f"Qwen2.5-0.5B-Instruct on an {gpu}, greedy, 16-bit weights", x=0.01, ha="left",
                      fontsize=12, color=INK)
         fig.tight_layout(rect=(0, 0.08, 1, 1))
@@ -312,7 +321,7 @@ def charts(r):
 
     # Many requests at once: total generated tokens/s against the number of requests.
     b = r.get("batched", {})
-    engines = [e for e in ENGINES if e in b]
+    engines = [e for e in CHART_ORDER if e in b]
     if engines:
         fig, ax = plt.subplots(figsize=(10, 4.6), facecolor=SURFACE)
         style(ax)

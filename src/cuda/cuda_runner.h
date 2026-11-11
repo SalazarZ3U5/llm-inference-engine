@@ -28,6 +28,8 @@ std::unique_ptr<BatchRunner> make_batch_runner(const Config& cfg, const Weights&
 
 // Multi-token matmuls (prefill) use tensor cores by default; switch off to compare.
 void set_tensor_cores(bool on);
+// Tensor-core matmuls in one FP16 pass (faster) instead of the exact two-pass BF16 split.
+void set_tc_fp16(bool on);
 
 // Compares every CUDA kernel with the CPU reference on random data. Returns 0 if all pass.
 int run_selftest();

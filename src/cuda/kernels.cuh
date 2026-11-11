@@ -112,6 +112,11 @@ void init_matmul_workspace();
 
 // Multi-token matmuls (prefill) use tensor cores by default; switch off to compare.
 void set_tensor_cores_impl(bool on);
+// Tensor-core matmuls run two BF16 passes by default (x = hi + lo, FP32-level
+// accuracy); on = one FP16 pass (x rounded to FP16 once): half the tensor-core
+// work, ~3 significant digits on the activations, as most engines do.
+void set_tc_fp16_impl(bool on);
+bool tc_fp16();
 bool tensor_cores();
 
 }  // namespace ie::cuda
