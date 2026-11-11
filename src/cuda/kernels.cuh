@@ -53,7 +53,8 @@ void rmsnorm(float* y, const float* x, const float* weight, int T, int dim, floa
 //   accumulate = true adds into y (fuses the residual connection: x += W·a).
 //   T < 32 (decode, small batches): one warp per output row, streaming weights at
 //     full bandwidth; a token's result doesn't depend on the other rows in the batch.
-//   T >= 32 (prefill): tensor cores on 64 x 64 output tiles (see set_tensor_cores_impl).
+//   T >= 32 (prefill, big batches): tensor cores on 64 x 64 output tiles, with K split
+//     across blocks when there are too few tiles to fill the GPU (see init_matmul_workspace).
 void matmul(float* y, const float* x, const DeviceMatrix& W, const float* bias, int T,
             bool accumulate, cudaStream_t stream);
 
@@ -91,6 +92,11 @@ void gather_rows(float* dst, const float* src, const int* rows, int R, int dim, 
 // out[r] = index of the largest value in x[r, 0..n), first one on ties (greedy decoding
 // on the GPU, so only R ints come back instead of R x vocab floats).
 void argmax_rows(int32_t* out, const float* x, int R, int n, cudaStream_t stream);
+
+// Allocates the scratch the tensor-core matmul uses to split small problems
+// across more blocks ("split-K"). Call once before launching (and before
+// recording a CUDA graph); without it, matmuls simply don't split.
+void init_matmul_workspace();
 
 // Multi-token matmuls (prefill) use tensor cores by default; switch off to compare.
 void set_tensor_cores_impl(bool on);

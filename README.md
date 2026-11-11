@@ -11,7 +11,7 @@ Target model: **Qwen2.5-0.5B-Instruct** (download needs no license approval). De
 > matching Hugging Face at every layer. Prefill uses tensor cores (**7,896 tok/s** on a 512-token
 > prompt) and flash-decoding attention keeps decode fast at long context (**184.5 tok/s after a
 > 4,000-token prompt**). A paged KV cache and continuous batching serve many requests at once:
-> **1,372 tok/s across 64 concurrent requests**, 7.4x serving them one at a time, with every request's
+> **1,767 tok/s across 64 concurrent requests**, 9.4x serving them one at a time, with every request's
 > output identical to serving it alone.
 
 ## Layout
@@ -45,6 +45,8 @@ src/
                         one CUDA graph per batch size; `test-cuda` self-test
 scripts/
   download_model.py     fetch weights + tokenizer into models/
+  profile.bat           Nsight Systems profiles of decode, long-context decode and serving
+  profile_summary.py    per-kernel GPU time from a profile, split by phase (prefill / decode / batch)
   reference.py          dump ground-truth activations from HF transformers into reference/
   make_tokenizer_cases.py   expected token ids from HF's tokenizer -> tests/tokenizer_cases.json
   gen_unicode_tables.py     regenerate src/unicode_tables.h
@@ -176,7 +178,7 @@ CUDA and one is present.
 - [x] INT8 weights on the GPU (per-row scales); perplexity identical to the CPU INT8 path (14.8453)
 - [x] Tensor-core GEMM for prefill (WMMA, 64x64 tiles): FP32 activations split into two BF16 parts
       (hi + lo) to keep FP32-level accuracy; BF16 and INT8 weights; 3.5x faster prefill, same perplexity
-- [ ] Profile with Nsight Systems / Nsight Compute; document each optimization
+- [x] Profile with Nsight Systems (`scripts\profile.bat`): per-kernel time for every phase, below
 
 ### Phase 4: advanced
 - [x] Flash-decoding attention: cached positions split into 256-token chunks across blocks, partial
@@ -216,7 +218,8 @@ CUDA and one is present.
 | 2026-11-11 | GPU: flash-decoding attention, 4,000-token prompt | 184.5 | 2492.9 | 8x the context costs only 3.6% decode speed |
 | 2026-11-11 | GPU: paged KV cache, 512-token prompt | 187.8 | 7401.5 | page lookups hoisted out of the attention loop + 4 loads in flight per warp |
 | 2026-11-11 | GPU: paged KV cache, 4,000-token prompt | 174.5 | 2174.9 | single-stream cost of paging, see below |
-| 2026-11-11 | **GPU: continuous batching, 64 concurrent requests** | **1371.6** | - | total across all requests: 7.4x one at a time, output identical |
+| 2026-11-11 | GPU: continuous batching, 64 concurrent requests | 1371.6 | - | total across all requests: 7.4x one at a time, output identical |
+| 2026-11-11 | **GPU: profile-guided batched matmuls (split-K, 4 rows per warp)** | **1766.8** | - | 64 requests: 9.4x one at a time; 16 requests 802 → 1,046 |
 
 Full sweep (`ie bench --sweep`, 64-token prompt, 32 generated tokens) on a Ryzen 5 3600XT
 (6 cores / 12 threads, AVX2, dual-channel DDR4) and an RTX 4060 (8 GB):
@@ -255,22 +258,45 @@ compares every request's tokens with serving it alone.
 
 | Concurrency | Throughput tok/s | Mean time to first token | Mean latency | p95 latency | Peak KV pages | Same as one at a time |
 |------------:|-----------------:|-------------------------:|-------------:|------------:|--------------:|:---|
-| 1 | 184.8 | 32.3 s | 33.2 s | 62.7 s | 48 | 64/64 |
-| 4 | 602.7 | 9.4 s | 10.5 s | 19.4 s | 152 | 64/64 |
-| 16 | 801.8 | 6.0 s | 9.4 s | 14.9 s | 556 | 64/64 |
-| 32 | 998.1 | 3.6 s | 8.7 s | 12.0 s | 1,097 | 64/64 |
-| 64 | **1,371.6** | 1.8 s | 7.9 s | 8.9 s | 2,146 | 64/64 |
+| 1 | 187.7 | 31.7 s | 32.7 s | 61.7 s | 48 | 64/64 |
+| 4 | 582.5 | 9.7 s | 10.9 s | 20.1 s | 152 | 64/64 |
+| 16 | 1,045.7 | 4.6 s | 7.2 s | 11.3 s | 556 | 64/64 |
+| 32 | 1,335.1 | 2.8 s | 6.5 s | 8.9 s | 1,097 | 64/64 |
+| 64 | **1,766.8** | 1.7 s | 6.2 s | 6.9 s | 2,146 | 64/64 |
 
 Decode streams all the weights once per step whether it serves one sequence or 64, so throughput
-grows with the batch: 3.3x at 4, 7.4x at 64. It grows more slowly past 4 because each step then spends
-more of its time on attention over 64 separate caches and on prefilling new arrivals (prompts are
-prefilled on their own between decode steps; chunked prefill would overlap them). Time to first token
-drops from 32 s to 1.8 s because requests no longer queue behind each other.
+grows with the batch: 3.1x at 4, 9.4x at 64. Time to first token drops from 32 s to 1.7 s because
+requests no longer queue behind each other. Prompts are prefilled on their own between decode steps
+(chunked prefill, which mixes them into decode steps, is a possible next step).
 
 The KV cache is split into 16-token pages handed out as sequences grow (peak 2,146 pages = 805 MiB for
 64 sequences, instead of reserving 64 x the maximum length). Batches under 32 rows run every matmul row
 exactly as it would run alone, so batching cannot change any request's output; the tensor-core path
 used for larger batches rounds differently in the last bits, but all 64 requests still matched here.
+
+### Where the time goes (Nsight Systems)
+
+`scripts\profile.bat` records every kernel with Nsight Systems; `scripts\profile_summary.py` splits the
+time by the engine's NVTX ranges (prefill, decode, batched decode). Times per forward pass, BF16:
+
+| Phase | Time | Biggest costs |
+|-------|-----:|---------------|
+| Decode, 1 sequence, 512 context | 5.6 ms | weight matmuls 83% (~238 GB/s while running; the card's peak is 272), attention 13% |
+| Decode, 64 sequences | 16.4 ms | attention 35%, gate/up 26%, other matmuls 21%, LM head 11% |
+| Prefill, 512 tokens | 67 ms | attention 38%, tensor-core matmuls 59% |
+| Prefill, 4,000 tokens | 1.82 s | attention 84% |
+
+The first profile changed the plan. Batches of 2-31 sequences gained almost nothing from batching (each
+extra sequence added ~0.7 ms per step): the matmul kernel re-read every activation once per weight row
+and ran out of on-chip bandwidth. Each warp now computes 4 weight rows (2 for gate/up) with every
+activation it loads, still adding in the same order so results stay bit-identical to running alone
+(+30% at 16 requests). At 64 sequences, a 896-row matmul made only 14 output tiles for 24 SMs, and the
+128-row K/V projections only 2, each block walking the whole inner dimension alone (44 us for a 0.2 MB
+matrix). Split-K now spreads small problems over 4 blocks per SM and adds the partial sums in a fixed
+order (+29% at 64 requests, and 16% faster prefill as a side effect).
+
+What's left is attention: decode reads each KV head once per query head (7 times), and prefill
+attention reads the whole cache once per prompt token, so it grows with the square of the prompt.
 
 Paging is not free for a single stream: finding a position's page adds a lookup to the attention loop.
 Loading each chunk's page ids once into shared memory and keeping 4 key/value loads in flight per warp

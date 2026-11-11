@@ -94,50 +94,70 @@ struct Int8 {
   __device__ static __forceinline__ float load1(const Elem* row, int k) { return float(row[k]); }
 };
 
-// The core of every matmul: one warp computes dot(wrow, x[i]) for nt <= NT tokens.
-// Lane j reads 16 bytes at [j*16, j*16+16), then 512 bytes further, and so on:
-// the 32 lanes together read 512 consecutive bytes per step, which is what GPU
-// memory is fastest at (a "coalesced" access). Each weight is converted once
-// and used for all nt tokens.
-template <class W, int NT>
-__device__ __forceinline__ void warp_dot(const typename W::Elem* __restrict__ wrow,
+// The core of every CUDA-core matmul: one warp computes dot(W[r], x[i]) for R
+// weight rows r and nt <= NT tokens i. Lane j reads 16 bytes of each row at
+// [j*16, j*16+16), then 512 bytes further, and so on: the 32 lanes together read
+// 512 consecutive bytes per step, which is what GPU memory is fastest at (a
+// "coalesced" access). Each weight is converted once and used for all nt
+// tokens, and each activation load is used for all R rows (with R = 1 every
+// row would re-read the activations, and small batches would be limited by
+// on-chip bandwidth instead of by the weights).
+//
+// For every (row, token), the lane adds its products in the same order and the
+// warp sums lanes the same way whatever R, NT and nt are, so a token's result is
+// bit-identical whether it is computed alone or in a batch.
+template <class W, int NT, int R>
+__device__ __forceinline__ void warp_dot(const typename W::Elem* const (&wrow)[R],
                                          const float* __restrict__ x, int cols, int nt,
-                                         float acc[NT]) {
+                                         float (&acc)[R][NT]) {
   constexpr int P = W::kPerLoad;
   const int lane = threadIdx.x & 31;
 #pragma unroll
-  for (int i = 0; i < NT; ++i) acc[i] = 0.0f;
+  for (int r = 0; r < R; ++r)
+#pragma unroll
+    for (int i = 0; i < NT; ++i) acc[r][i] = 0.0f;
   if (cols % P == 0) {  // fast path: 16-byte loads (every row of this model)
     for (int k = lane * P; k < cols; k += 32 * P) {
-      float w[P];
-      W::unpack(__ldg(reinterpret_cast<const uint4*>(wrow + k)), w);
+      float w[R][P];
+#pragma unroll
+      for (int r = 0; r < R; ++r) W::unpack(__ldg(reinterpret_cast<const uint4*>(wrow[r] + k)), w[r]);
 #pragma unroll
       for (int i = 0; i < NT; ++i) {
         if (i < nt) {
           const float4* xp = reinterpret_cast<const float4*>(x + size_t(i) * cols + k);
-          float s = acc[i];
+          float4 a[P / 4];
 #pragma unroll
-          for (int j = 0; j < P / 4; ++j) {
-            const float4 a = xp[j];
-            s = fmaf(w[4 * j + 0], a.x, s);
-            s = fmaf(w[4 * j + 1], a.y, s);
-            s = fmaf(w[4 * j + 2], a.z, s);
-            s = fmaf(w[4 * j + 3], a.w, s);
+          for (int j = 0; j < P / 4; ++j) a[j] = xp[j];
+#pragma unroll
+          for (int r = 0; r < R; ++r) {
+            float s = acc[r][i];
+#pragma unroll
+            for (int j = 0; j < P / 4; ++j) {
+              s = fmaf(w[r][4 * j + 0], a[j].x, s);
+              s = fmaf(w[r][4 * j + 1], a[j].y, s);
+              s = fmaf(w[r][4 * j + 2], a[j].z, s);
+              s = fmaf(w[r][4 * j + 3], a[j].w, s);
+            }
+            acc[r][i] = s;
           }
-          acc[i] = s;
         }
       }
     }
   } else {  // general path: one weight per lane per step
     for (int k = lane; k < cols; k += 32) {
-      const float w = W::load1(wrow, k);
 #pragma unroll
-      for (int i = 0; i < NT; ++i)
-        if (i < nt) acc[i] = fmaf(w, x[size_t(i) * cols + k], acc[i]);
+      for (int r = 0; r < R; ++r) {
+        const float w = W::load1(wrow[r], k);
+#pragma unroll
+        for (int i = 0; i < NT; ++i)
+          if (i < nt) acc[r][i] = fmaf(w, x[size_t(i) * cols + k], acc[r][i]);
+      }
     }
   }
 #pragma unroll
-  for (int i = 0; i < NT; ++i) acc[i] = warp_sum(acc[i]);
+  for (int r = 0; r < R; ++r)
+#pragma unroll
+    for (int i = 0; i < NT; ++i) acc[r][i] = warp_sum(acc[r][i]);
 }
 
 constexpr int kWarpsPerBlock = 8;  // 256 threads = 8 output rows per block
@@ -171,48 +191,68 @@ __global__ void rmsnorm_kernel(float* y, const float* x, const float* __restrict
   for (int i = threadIdx.x; i < dim; i += blockDim.x) yt[i] = xt[i] * inv_rms * w[i];
 }
 
-template <class W, int NT>
+// One warp per R consecutive output rows. Rows past the end re-read the last
+// real row (results discarded), so every warp runs the same code.
+template <class W, int NT, int R>
 __global__ void matmul_kernel(float* __restrict__ y, const float* __restrict__ x,
                               const typename W::Elem* __restrict__ Wm,
                               const float* __restrict__ scale, const float* __restrict__ bias,
                               int T, int rows, int cols, bool accumulate) {
-  const int row = blockIdx.x * kWarpsPerBlock + (threadIdx.x >> 5);
-  if (row >= rows) return;  // whole warp leaves together, so shuffles stay safe
-  const typename W::Elem* wrow = Wm + size_t(row) * cols;
-  const float s = W::kScaled ? scale[row] : 1.0f;
-  const float b = bias ? bias[row] : 0.0f;
+  const int row0 = (blockIdx.x * kWarpsPerBlock + (threadIdx.x >> 5)) * R;
+  if (row0 >= rows) return;  // whole warp leaves together, so shuffles stay safe
+  const typename W::Elem* wrow[R];
+#pragma unroll
+  for (int r = 0; r < R; ++r) wrow[r] = Wm + size_t(min(row0 + r, rows - 1)) * cols;
   for (int t0 = 0; t0 < T; t0 += NT) {
     const int nt = min(NT, T - t0);
-    float acc[NT];
-    warp_dot<W, NT>(wrow, x + size_t(t0) * cols, cols, nt, acc);
+    float acc[R][NT];
+    warp_dot<W, NT, R>(wrow, x + size_t(t0) * cols, cols, nt, acc);
     if ((threadIdx.x & 31) == 0) {
-      for (int i = 0; i < nt; ++i) {
-        float* dst = y + size_t(t0 + i) * rows + row;
-        const float v = acc[i] * s + b;
-        *dst = accumulate ? *dst + v : v;
+#pragma unroll
+      for (int r = 0; r < R; ++r) {
+        const int row = row0 + r;
+        if (row >= rows) break;
+        const float s = W::kScaled ? scale[row] : 1.0f, b = bias ? bias[row] : 0.0f;
+        for (int i = 0; i < nt; ++i) {
+          float* dst = y + size_t(t0 + i) * rows + row;
+          const float v = acc[r][i] * s + b;
+          *dst = accumulate ? *dst + v : v;
+        }
       }
     }
   }
 }
 
-template <class W, int NT>
+template <class W, int NT, int R>
 __global__ void gate_up_silu_kernel(float* __restrict__ out, const float* __restrict__ x,
                                     const typename W::Elem* __restrict__ Wg,
                                     const float* __restrict__ sg,
                                     const typename W::Elem* __restrict__ Wu,
                                     const float* __restrict__ su, int T, int rows, int cols) {
-  const int row = blockIdx.x * kWarpsPerBlock + (threadIdx.x >> 5);
-  if (row >= rows) return;
-  const float scale_g = W::kScaled ? sg[row] : 1.0f, scale_u = W::kScaled ? su[row] : 1.0f;
+  const int row0 = (blockIdx.x * kWarpsPerBlock + (threadIdx.x >> 5)) * R;
+  if (row0 >= rows) return;
+  // Gate and up rows go through one warp_dot call as 2R rows, sharing the activation loads.
+  const typename W::Elem* wrow[2 * R];
+#pragma unroll
+  for (int r = 0; r < R; ++r) {
+    const size_t off = size_t(min(row0 + r, rows - 1)) * cols;
+    wrow[r] = Wg + off;
+    wrow[R + r] = Wu + off;
+  }
   for (int t0 = 0; t0 < T; t0 += NT) {
     const int nt = min(NT, T - t0);
-    float g[NT], u[NT];
-    warp_dot<W, NT>(Wg + size_t(row) * cols, x + size_t(t0) * cols, cols, nt, g);
-    warp_dot<W, NT>(Wu + size_t(row) * cols, x + size_t(t0) * cols, cols, nt, u);
+    float acc[2 * R][NT];
+    warp_dot<W, NT, 2 * R>(wrow, x + size_t(t0) * cols, cols, nt, acc);
     if ((threadIdx.x & 31) == 0) {
-      for (int i = 0; i < nt; ++i) {
-        const float gi = g[i] * scale_g;
-        out[size_t(t0 + i) * rows + row] = gi / (1.0f + expf(-gi)) * (u[i] * scale_u);
+#pragma unroll
+      for (int r = 0; r < R; ++r) {
+        const int row = row0 + r;
+        if (row >= rows) break;
+        const float scale_g = W::kScaled ? sg[row] : 1.0f, scale_u = W::kScaled ? su[row] : 1.0f;
+        for (int i = 0; i < nt; ++i) {
+          const float gi = acc[r][i] * scale_g;
+          out[size_t(t0 + i) * rows + row] = gi / (1.0f + expf(-gi)) * (acc[R + r][i] * scale_u);
+        }
       }
     }
   }
@@ -518,7 +558,8 @@ __global__ void __launch_bounds__(kTcThreads)
 tc_gemm_kernel(float* __restrict__ y, const float* __restrict__ x,
                const typename W::Elem* __restrict__ W0, const float* __restrict__ s0,
                const typename W::Elem* __restrict__ W1, const float* __restrict__ s1,
-               const float* __restrict__ bias, int T, int N, int K, bool accumulate) {
+               const float* __restrict__ bias, int T, int N, int K, bool accumulate,
+               int k_split, float* __restrict__ partial) {
   constexpr int kNumB = kGateUp ? 2 : 1;
   constexpr int kMainBytes = (2 + kNumB) * kTileBytes;      // A hi, A lo, B tile(s)
   constexpr int kEpiBytes = kNumB * kTileM * kLdC * 4;      // FP32 output tile(s)
@@ -540,7 +581,9 @@ tc_gemm_kernel(float* __restrict__ y, const float* __restrict__ x,
 #pragma unroll
       for (int j = 0; j < 2; ++j) wmma::fill_fragment(acc[b][i][j], 0.0f);
 
-  for (int k0 = 0; k0 < K; k0 += kTileK) {
+  // Split-K: block z covers columns [z * k_split, (z + 1) * k_split) only.
+  const int k_begin = blockIdx.z * k_split, k_end = min(K, k_begin + k_split);
+  for (int k0 = k_begin; k0 < k_end; k0 += kTileK) {
     tc_load_a(a_hi, a_lo, x, T, K, m0, k0);
 #pragma unroll
     for (int b = 0; b < kNumB; ++b) tc_load_b<W>(b_tile[b], mats[b], N, K, n0, k0);
@@ -588,6 +631,12 @@ tc_gemm_kernel(float* __restrict__ y, const float* __restrict__ x,
   for (int idx = threadIdx.x; idx < kTileM * kTileN; idx += kTcThreads) {
     const int m = idx / kTileN, n = idx % kTileN, gm = m0 + m, gn = n0 + n;
     if (gm >= T || gn >= N) continue;
+    if (partial) {  // split-K: raw sums only; splitk_reduce_kernel finishes the job
+#pragma unroll
+      for (int b = 0; b < kNumB; ++b)
+        partial[((size_t(blockIdx.z) * kNumB + b) * T + gm) * N + gn] = c_tile[b][m * kLdC + n];
+      continue;
+    }
     float* dst = y + size_t(gm) * N + gn;
     if constexpr (kGateUp) {
       const float g = c_tile[0][m * kLdC + n] * (W::kScaled ? s0[gn] : 1.0f);
@@ -599,6 +648,36 @@ tc_gemm_kernel(float* __restrict__ y, const float* __restrict__ x,
     }
   }
 }
+
+// Adds the split-K partial sums in a fixed order (deterministic, unlike atomics),
+// then applies the same epilogue as tc_gemm_kernel. One thread per output.
+template <class W, bool kGateUp>
+__global__ void splitk_reduce_kernel(float* __restrict__ y, const float* __restrict__ partial,
+                                     const float* __restrict__ s0, const float* __restrict__ s1,
+                                     const float* __restrict__ bias, int T, int N, int splits,
+                                     bool accumulate) {
+  constexpr int kNumB = kGateUp ? 2 : 1;
+  const size_t idx = size_t(blockIdx.x) * blockDim.x + threadIdx.x, plane = size_t(T) * N;
+  if (idx >= plane) return;
+  const int gn = int(idx % N);
+  float sum[kNumB] = {};
+  for (int z = 0; z < splits; ++z)
+#pragma unroll
+    for (int b = 0; b < kNumB; ++b) sum[b] += partial[(size_t(z) * kNumB + b) * plane + idx];
+  if constexpr (kGateUp) {
+    const float g = sum[0] * (W::kScaled ? s0[gn] : 1.0f);
+    const float u = sum[1] * (W::kScaled ? s1[gn] : 1.0f);
+    y[idx] = g / (1.0f + expf(-g)) * u;
+  } else {
+    const float v = sum[0] * (W::kScaled ? s0[gn] : 1.0f) + (bias ? bias[gn] : 0.0f);
+    y[idx] = accumulate ? y[idx] + v : v;
+  }
+}
+
+// Split-K scratch, shared by every matmul (they run one after another on a stream).
+float* g_splitk_ws = nullptr;
+size_t g_splitk_floats = 0;
+int g_num_sms = 0;
 
 bool g_tensor_cores = true;
 
@@ -612,28 +691,65 @@ bool use_tensor_cores(int T, int cols) {
   return g_tensor_cores && T >= kTcMinTokens && cols % kTileK == 0;
 }
 
+// How many ways to split K. A 64-token batch through a 896-row matrix makes only
+// 14 output tiles: 14 blocks on a 24-SM GPU, each walking all K columns alone
+// (4,864 for down_proj). Splitting K gives every SM work; the price is writing
+// and re-reading the partial sums, which is small next to the weights.
+// The target is 4 blocks per SM: this kernel waits on its loads with only 4 warps
+// per block, so it needs several blocks per SM to keep memory busy.
+int splitk_ways(int tiles, int K, int outputs) {
+  const int target = 4 * g_num_sms;
+  if (!g_splitk_ws || tiles >= target) return 1;
+  const int steps = K / kTileK;
+  int ways = std::min({(target + tiles - 1) / tiles, std::max(1, steps / 2), 16});
+  while (ways > 1 && size_t(ways) * outputs > g_splitk_floats) --ways;
+  return ways;
+}
+
 template <class W, bool kGateUp>
 void launch_tc(float* y, const float* x, const DeviceMatrix& A, const DeviceMatrix* B,
                const float* bias, int T, bool accumulate, cudaStream_t stream) {
-  const dim3 grid((A.rows + kTileN - 1) / kTileN, (T + kTileM - 1) / kTileM);
+  constexpr int kNumB = kGateUp ? 2 : 1;
+  const int N = A.rows, K = A.cols;
+  dim3 grid((N + kTileN - 1) / kTileN, (T + kTileM - 1) / kTileM);
+  const int ways = splitk_ways(int(grid.x * grid.y), K, kNumB * T * N);
+  // Columns per split, a whole number of tiles; recount the splits that are non-empty.
+  const int k_split = ((K / kTileK + ways - 1) / ways) * kTileK;
+  const int splits = (K + k_split - 1) / k_split;
+  grid.z = splits;
   using E = typename W::Elem;
   tc_gemm_kernel<W, kGateUp><<<grid, kTcThreads, 0, stream>>>(
       y, x, static_cast<const E*>(A.data), A.scale, B ? static_cast<const E*>(B->data) : nullptr,
-      B ? B->scale : nullptr, bias, T, A.rows, A.cols, accumulate);
+      B ? B->scale : nullptr, bias, T, N, K, accumulate, k_split, splits > 1 ? g_splitk_ws : nullptr);
+  if (splits > 1) {
+    const size_t outputs = size_t(T) * N;
+    splitk_reduce_kernel<W, kGateUp><<<unsigned((outputs + 255) / 256), 256, 0, stream>>>(
+        y, g_splitk_ws, A.scale, B ? B->scale : nullptr, bias, T, N, splits, accumulate);
+  }
 }
 
-int blocks_for(int rows) { return (rows + kWarpsPerBlock - 1) / kWarpsPerBlock; }
+// Decode (T = 1) streams the weights: one row per warp keeps the most loads in
+// flight. Small batches (T = 2..31) reuse each activation load for several rows.
+constexpr int kBatchRows = 4;     // rows per warp, matmul (T > 1)
+constexpr int kBatchRowsGU = 2;   // rows per warp, gate_up (x2: gate and up)
+constexpr int kBatchTokens = 8;   // tokens per pass over the weights (T > 1)
+
+int blocks_for(int rows, int rows_per_warp) {
+  const int per_block = kWarpsPerBlock * rows_per_warp;
+  return (rows + per_block - 1) / per_block;
+}
 
 template <class W>
 void launch_matmul(float* y, const float* x, const DeviceMatrix& M, const float* bias, int T,
                    bool accumulate, cudaStream_t stream) {
   const auto* data = static_cast<const typename W::Elem*>(M.data);
   if (T == 1)
-    matmul_kernel<W, 1><<<blocks_for(M.rows), kWarpsPerBlock * 32, 0, stream>>>(
+    matmul_kernel<W, 1, 1><<<blocks_for(M.rows, 1), kWarpsPerBlock * 32, 0, stream>>>(
         y, x, data, M.scale, bias, T, M.rows, M.cols, accumulate);
   else
-    matmul_kernel<W, 4><<<blocks_for(M.rows), kWarpsPerBlock * 32, 0, stream>>>(
-        y, x, data, M.scale, bias, T, M.rows, M.cols, accumulate);
+    matmul_kernel<W, kBatchTokens, kBatchRows>
+        <<<blocks_for(M.rows, kBatchRows), kWarpsPerBlock * 32, 0, stream>>>(
+            y, x, data, M.scale, bias, T, M.rows, M.cols, accumulate);
 }
 
 template <class W>
@@ -642,11 +758,12 @@ void launch_gate_up(float* out, const float* x, const DeviceMatrix& G, const Dev
   const auto* g = static_cast<const typename W::Elem*>(G.data);
   const auto* u = static_cast<const typename W::Elem*>(U.data);
   if (T == 1)
-    gate_up_silu_kernel<W, 1><<<blocks_for(G.rows), kWarpsPerBlock * 32, 0, stream>>>(
+    gate_up_silu_kernel<W, 1, 1><<<blocks_for(G.rows, 1), kWarpsPerBlock * 32, 0, stream>>>(
         out, x, g, G.scale, u, U.scale, T, G.rows, G.cols);
   else
-    gate_up_silu_kernel<W, 4><<<blocks_for(G.rows), kWarpsPerBlock * 32, 0, stream>>>(
-        out, x, g, G.scale, u, U.scale, T, G.rows, G.cols);
+    gate_up_silu_kernel<W, kBatchTokens, kBatchRowsGU>
+        <<<blocks_for(G.rows, kBatchRowsGU), kWarpsPerBlock * 32, 0, stream>>>(
+            out, x, g, G.scale, u, U.scale, T, G.rows, G.cols);
 }
 
 }  // namespace
@@ -668,6 +785,18 @@ void rmsnorm(float* y, const float* x, const float* weight, int T, int dim, floa
 }
 
 void set_tensor_cores_impl(bool on) { g_tensor_cores = on; }
+
+void init_matmul_workspace() {
+  if (g_splitk_ws) return;
+  int dev = 0;
+  if (cudaGetDevice(&dev) != cudaSuccess ||
+      cudaDeviceGetAttribute(&g_num_sms, cudaDevAttrMultiProcessorCount, dev) != cudaSuccess)
+    throw std::runtime_error("init_matmul_workspace: cannot query the GPU");
+  constexpr size_t kFloats = size_t(8) << 20;  // 32 MiB, kept for the life of the process
+  if (cudaMalloc(&g_splitk_ws, kFloats * sizeof(float)) != cudaSuccess)
+    throw std::runtime_error("init_matmul_workspace: out of GPU memory");
+  g_splitk_floats = kFloats;
+}
 bool tensor_cores() { return g_tensor_cores; }
 
 void matmul(float* y, const float* x, const DeviceMatrix& W, const float* bias, int T,

@@ -153,6 +153,7 @@ class CudaEngine final : public Runner, public BatchRunner {
     check(cudaGetDeviceProperties(&prop, 0), "cudaGetDeviceProperties");
     name_ = std::string("cuda, ") + prop.name + (use_graphs_ ? ", graphs" : ", no graphs");
     check(cudaStreamCreateWithFlags(&stream_, cudaStreamNonBlocking), "cudaStreamCreate");
+    init_matmul_workspace();  // before any graph is recorded
 
     // Weights: copied once, stay in VRAM in their storage format.
     embed_ = mem_.upload_matrix(w.embed);
@@ -679,10 +680,13 @@ int run_selftest() {
   DeviceMemory mem;
   char what[160];
   const cudaStream_t s = nullptr;  // the default stream is fine for tests
+  init_matmul_workspace();
 
   // matmul and gate_up_silu, for both weight formats, against ie::linear on the
   // exact values the GPU holds. Column counts 72 and 75 exercise the slow path
-  // (not a multiple of the 16-byte load width). Tensor cores engage from 32 rows.
+  // (not a multiple of the 16-byte load width). Tensor cores engage from 32 rows;
+  // small shapes there split K across blocks, and 3200 x 96 has enough output
+  // tiles (50 at 64 rows) to run unsplit.
   struct Shape { int rows, cols; };
   for (bool tc : {false, true})
   for (DType dt : {DType::BF16, DType::I8}) {
@@ -691,7 +695,7 @@ int run_selftest() {
     const char* path = tc ? "tc" : "cuda-core";
     // Split-BF16 tensor-core results are within ~1e-5 of FP32; allow a little more.
     const double tol = tc ? 1e-4 : 2e-5;
-    for (Shape sh : {Shape{37, 72}, Shape{37, 75}, Shape{128, 896}, Shape{300, 896}, Shape{64, 4864}}) {
+    for (Shape sh : {Shape{37, 72}, Shape{37, 75}, Shape{128, 896}, Shape{300, 896}, Shape{64, 4864}, Shape{3200, 96}}) {
       Matrix m = make_matrix(random_vec(rng, size_t(sh.rows) * sh.cols, 0.1f), sh.rows, sh.cols, dt);
       Matrix m2 = make_matrix(random_vec(rng, size_t(sh.rows) * sh.cols, 0.1f), sh.rows, sh.cols, dt);
       std::vector<float> deq = dequantized(m), deq2 = dequantized(m2);
@@ -742,23 +746,37 @@ int run_selftest() {
   }
   set_tensor_cores_impl(true);
 
-  // Batching must not change results: a row computed in a batch of 8 (cuda-core
-  // path) must equal the same row computed alone, bit for bit.
-  {
-    Matrix m = make_matrix(random_vec(rng, size_t(896) * 896, 0.1f), 896, 896, DType::BF16);
-    DeviceMatrix dW = mem.upload_matrix(m);
-    std::vector<float> x = random_vec(rng, size_t(8) * 896, 1.0f);
-    float* dx = mem.upload(x);
-    float* dy8 = mem.alloc<float>(size_t(8) * 896);
-    float* dy1 = mem.alloc<float>(896);
-    matmul(dy8, dx, dW, nullptr, 8, false, s);
-    bool same = true;
-    for (int t = 0; t < 8; ++t) {
-      matmul(dy1, dx + size_t(t) * 896, dW, nullptr, 1, false, s);
-      std::vector<float> a = download(dy8 + size_t(t) * 896, 896), b = download(dy1, 896);
-      same = same && std::memcmp(a.data(), b.data(), a.size() * sizeof(float)) == 0;
+  // Batching must not change results: on the CUDA-core path (batches under 32),
+  // a token computed in a batch must equal the same token computed alone, bit
+  // for bit, for both kernels and both weight formats, including partial groups
+  // (batches that aren't a multiple of the 8 tokens processed per pass) and a
+  // row count (900) that isn't a multiple of the rows per warp.
+  for (DType dt : {DType::BF16, DType::I8}) {
+    const int rows = 900, cols = 896;
+    Matrix m = make_matrix(random_vec(rng, size_t(rows) * cols, 0.1f), rows, cols, dt);
+    Matrix m2 = make_matrix(random_vec(rng, size_t(rows) * cols, 0.1f), rows, cols, dt);
+    DeviceMatrix dW = mem.upload_matrix(m), dW2 = mem.upload_matrix(m2);
+    float* dbias = mem.upload(random_vec(rng, rows, 1.0f));
+    for (int T : {2, 8, 13, 31}) {
+      std::vector<float> x = random_vec(rng, size_t(T) * cols, 1.0f);
+      float* dx = mem.upload(x);
+      float* dyb = mem.alloc<float>(size_t(T) * rows);
+      float* dy1 = mem.alloc<float>(rows);
+      bool same = true;
+      for (int kernel = 0; kernel < 2; ++kernel) {
+        if (kernel == 0) matmul(dyb, dx, dW, dbias, T, false, s);
+        else gate_up_silu(dyb, dx, dW, dW2, T, s);
+        for (int t = 0; t < T; ++t) {
+          if (kernel == 0) matmul(dy1, dx + size_t(t) * cols, dW, dbias, 1, false, s);
+          else gate_up_silu(dy1, dx + size_t(t) * cols, dW, dW2, 1, s);
+          std::vector<float> a = download(dyb + size_t(t) * rows, rows), b = download(dy1, rows);
+          same = same && std::memcmp(a.data(), b.data(), a.size() * sizeof(float)) == 0;
+        }
+      }
+      std::snprintf(what, sizeof(what), "batch of %d == %d single tokens, bit for bit (%s)", T, T,
+                    dtype_name(dt));
+      tally.add_exact(what, same);
     }
-    tally.add_exact("batch of 8 == 8 single rows, bit for bit", same);
   }
 
   // rmsnorm
