@@ -6,16 +6,33 @@
 // weight matrices are [rows, cols] (nn.Linear's [out, in]); everything that
 // isn't a weight matrix is FP32.
 //
-// The current position (number of tokens already in the KV cache) is read from
-// device memory (`pos`), not passed as an argument. That way a recorded CUDA
-// graph of the decode step stays valid for every position: only the value in
-// memory changes between replays.
+// Every row (token) of a forward pass carries its own sequence id and position,
+// read from device memory (`row_seq`, `row_pos`). One call can therefore mix
+// tokens from different sequences (batching), and a recorded CUDA graph stays
+// valid for every position: only the values in memory change between replays.
+//
+// The KV cache is *paged*: each layer has a pool of pages of `page_size` token
+// rows, and each sequence has a page table listing its pages in order. Token
+// position p of sequence s lives in page tables[s * max_pages + p / page_size],
+// row p % page_size. Sequences grow one page at a time and never need one big
+// contiguous block, so memory isn't reserved for the maximum length up front.
 
 #include <cuda_runtime.h>
 
 #include <cstdint>
 
 namespace ie::cuda {
+
+// Token rows per KV page. A compile-time constant so kernels find a position's
+// page with a shift instead of a division; the attention chunk (256) is a multiple.
+constexpr int kKvPageSize = 16;
+
+// Where each sequence's KV rows live (see above). Passed to kernels by value.
+struct KvLayout {
+  const int* tables = nullptr;  // [num_sequences * max_pages] page ids
+  int max_pages = 0;            // row stride of `tables`
+  int page_size = kKvPageSize;  // must equal kKvPageSize (checked at launch)
+};
 
 // A weight matrix in VRAM, stored as BF16 or as INT8 with one scale per row.
 struct DeviceMatrix {
@@ -34,8 +51,9 @@ void rmsnorm(float* y, const float* x, const float* weight, int T, int dim, floa
 
 // y[t, o] (+)= dot(W[o, :], x[t, :]) + bias[o]
 //   accumulate = true adds into y (fuses the residual connection: x += W·a).
-//   T = 1 (decode): one warp per output row, streaming weights at full bandwidth.
-//   T >= 2 (prefill): tensor cores on 64 x 64 output tiles (see set_tensor_cores_impl).
+//   T < 32 (decode, small batches): one warp per output row, streaming weights at
+//     full bandwidth; a token's result doesn't depend on the other rows in the batch.
+//   T >= 32 (prefill): tensor cores on 64 x 64 output tiles (see set_tensor_cores_impl).
 void matmul(float* y, const float* x, const DeviceMatrix& W, const float* bias, int T,
             bool accumulate, cudaStream_t stream);
 
@@ -44,21 +62,35 @@ void matmul(float* y, const float* x, const DeviceMatrix& W, const float* bias, 
 void gate_up_silu(float* out, const float* x, const DeviceMatrix& Wg, const DeviceMatrix& Wu,
                   int T, cudaStream_t stream);
 
-// Applies RoPE to q (in place) and k, then writes k and v into the KV cache at
-// rows *pos .. *pos+T-1. inv_freq: [head_dim / 2] rotation frequencies.
-void rope_and_cache(float* q, const float* k, const float* v, float* k_cache, float* v_cache,
-                    const float* inv_freq, int T, const int* pos, int n_heads, int n_kv_heads,
-                    int head_dim, cudaStream_t stream);
+// Applies RoPE to q (in place) and k, then writes row t's key and value into the
+// paged cache of its sequence at its position. inv_freq: [head_dim / 2].
+//   k_pool, v_pool: this layer's page pool, [num_pages * page_size, kv_dim]
+void rope_and_cache(float* q, const float* k, const float* v, float* k_pool, float* v_pool,
+                    const float* inv_freq, int T, const int* row_pos, const int* row_seq,
+                    KvLayout kv, int n_heads, int n_kv_heads, int head_dim, cudaStream_t stream);
 
-// Causal grouped-query attention for T new tokens over the cache (*pos + T rows).
-//   q: [T, n_heads*head_dim]   k_cache, v_cache: [max_tokens, n_kv_heads*head_dim]
-//   out: [T, n_heads*head_dim]. Shared memory is sized for max_tokens.
-void attention(float* out, const float* q, const float* k_cache, const float* v_cache, int T,
-               const int* pos, int max_tokens, int n_heads, int n_kv_heads, int head_dim,
+// Causal grouped-query attention for T rows, each over its own sequence's cached
+// positions 0..row_pos[t], "flash-decoding" style: cached positions are split
+// into chunks handled by separate blocks, then merged exactly.
+//   q: [T, n_heads*head_dim]   out: [T, n_heads*head_dim]
+//   num_chunks: attention_chunks(context) for the longest context this launch may
+//     see (the maximum sequence length when recording a graph; extra chunks exit).
+//   part_o: scratch [T * n_heads * num_chunks * head_dim]
+//   part_ml: scratch [T * n_heads * num_chunks * 2]
+void attention(float* out, const float* q, const float* k_pool, const float* v_pool, int T,
+               const int* row_pos, const int* row_seq, KvLayout kv, int num_chunks,
+               float* part_o, float* part_ml, int n_heads, int n_kv_heads, int head_dim,
                cudaStream_t stream);
 
-// Largest context the attention kernel supports (its scores live in shared memory).
-int attention_max_tokens();
+// Number of chunks needed to cover `context_tokens` cached positions.
+int attention_chunks(int context_tokens);
+
+// dst[r, :] = src[rows[r], :] for r < R   (picks the rows that need logits)
+void gather_rows(float* dst, const float* src, const int* rows, int R, int dim, cudaStream_t stream);
+
+// out[r] = index of the largest value in x[r, 0..n), first one on ties (greedy decoding
+// on the GPU, so only R ints come back instead of R x vocab floats).
+void argmax_rows(int32_t* out, const float* x, int R, int n, cudaStream_t stream);
 
 // Multi-token matmuls (prefill) use tensor cores by default; switch off to compare.
 void set_tensor_cores_impl(bool on);

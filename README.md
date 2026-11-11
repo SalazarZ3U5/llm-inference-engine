@@ -5,11 +5,14 @@ It loads Hugging Face `safetensors` weights and generates text on an NVIDIA GPU.
 
 Target model: **Qwen2.5-0.5B-Instruct** (download needs no license approval). Development GPU: RTX 4060 (sm_89, 8 GB).
 
-> Status: **Phase 3 (CUDA) nearly complete.** The whole forward pass runs on an RTX 4060 with
+> Status: **Phase 4 (serving) in progress.** The whole forward pass runs on an RTX 4060 with
 > hand-written CUDA kernels and CUDA graphs: **213.8 tok/s decode with BF16** (211 GB/s, 97% of the
 > measured memory bandwidth) and **361.6 tok/s with INT8**, 127x the first working version, while still
-> matching Hugging Face at every layer. Prefill uses tensor cores: **5,508 tok/s** on a 512-token
-> prompt. Next: profiling, then Phase 4 (flash attention for long contexts, batching).
+> matching Hugging Face at every layer. Prefill uses tensor cores (**7,896 tok/s** on a 512-token
+> prompt) and flash-decoding attention keeps decode fast at long context (**184.5 tok/s after a
+> 4,000-token prompt**). A paged KV cache and continuous batching serve many requests at once:
+> **1,372 tok/s across 64 concurrent requests**, 7.4x serving them one at a time, with every request's
+> output identical to serving it alone.
 
 ## Layout
 
@@ -18,7 +21,7 @@ CMakeLists.txt          build (CUDA on by default; -DIE_ENABLE_CUDA=OFF for CPU-
 CMakePresets.json       release / debug / cpu-only presets (Ninja + MSVC)
 .clangd                 editor config so clangd understands .cu files
 src/
-  main.cpp              `ie` CLI: generate, chat, tokenize, verify, test-tokenizer, inspect, gpu-check
+  main.cpp              `ie` CLI: generate, chat, tokenize, verify, bench, serve-bench, perplexity, ...
   safetensors.{h,cpp}   weight-file reader (header parse + validation + lazy tensor reads)
   npy.{h,cpp}           .npy reader for reference activations + array comparison
   config.{h,cpp}        Config struct loaded from config.json
@@ -30,13 +33,16 @@ src/
   sampler.{h,cpp}       temperature, top-k, top-p, repetition penalty; defaults from generation_config.json
   matrix.{h,cpp}        weight matrices as f32 / bf16 / int8; blocked matmul with scalar and AVX2 kernels
   threadpool.{h,cpp}    fixed thread pool for parallel loops (spins briefly, then sleeps)
-  runner.{h,cpp}        Runner interface (weights + KV cache on one device); CPU implementation
+  runner.{h,cpp}        Runner interface (weights + KV cache on one device); CPU implementation;
+                        BatchRunner interface (many sequences, paged KV cache)
   cuda/
     cuda_check.cuh      CUDA_CHECK error macro
     device_check.cu     GPU info, vector-add test, memory-bandwidth test
-    kernels.{cuh,cu}    GPU kernels: embedding, RMSNorm, BF16 matmul (warp per row), fused
-                        gate/up/SiLU, RoPE + KV-cache write, attention
-    cuda_runner.{h,cu}  GPU Runner: BF16 weights and KV cache in VRAM; `test-cuda` self-test
+    kernels.{cuh,cu}    GPU kernels: embedding, RMSNorm, matmul (warp per row; tensor cores for
+                        prefill), fused gate/up/SiLU, RoPE + paged KV-cache write, flash-decoding
+                        attention over paged caches, row gather, argmax
+    cuda_runner.{h,cu}  GPU engine (Runner + BatchRunner): weights and paged KV cache in VRAM,
+                        one CUDA graph per batch size; `test-cuda` self-test
 scripts/
   download_model.py     fetch weights + tokenizer into models/
   reference.py          dump ground-truth activations from HF transformers into reference/
@@ -117,12 +123,16 @@ build\release\ie.exe bench models\qwen2.5-0.5b-instruct --sweep
 build\release\ie.exe perplexity models\qwen2.5-0.5b-instruct tests\perplexity.txt --weights int8
 build\release\ie.exe test-kernels
 build\release\ie.exe test-cuda
+build\release\ie.exe serve-bench models\qwen2.5-0.5b-instruct --prompt-tokens 512 --gen-tokens 256 --check
 ```
 
 `bench --sweep` walks through every optimization step (scalar → AVX2 → threads → BF16 → INT8) and
 prints a table of prefill and decode speed. `perplexity` scores how well the model predicts a fixed
 text (lower is better), which is how INT8 is checked against BF16. `test-kernels` checks every matmul
 kernel against the plain reference implementation, and `test-cuda` does the same for every GPU kernel.
+`serve-bench` sends 64 requests of varied lengths at once and serves them at several concurrency levels
+(`--concurrency 1,4,16,32,64`), reporting throughput, time to first token and latency; `--check` confirms
+every request gets exactly the tokens it gets when served alone.
 
 Every command that runs the model takes `--device cpu|cuda`. The default is the GPU when the build has
 CUDA and one is present.
@@ -161,7 +171,7 @@ CUDA and one is present.
 - [x] BF16 weights and FP32 KV cache resident in VRAM; whole forward pass on the GPU
 - [x] Own kernels: BF16 matmul (one warp per row, coalesced 16-byte loads), RMSNorm, RoPE + cache
       write, attention, fused gate/up/SiLU, residual adds fused into the matmuls
-- [x] `ie verify --device cuda` passes (30/30); `test-cuda` checks every kernel against the CPU code (96/96)
+- [x] `ie verify --device cuda` passes (30/30); `test-cuda` checks every kernel against the CPU code (618 tests, incl. paged caches)
 - [x] CUDA graphs: each decode step (~243 kernels) recorded once and replayed with one call (+8%)
 - [x] INT8 weights on the GPU (per-row scales); perplexity identical to the CPU INT8 path (14.8453)
 - [x] Tensor-core GEMM for prefill (WMMA, 64x64 tiles): FP32 activations split into two BF16 parts
@@ -169,9 +179,19 @@ CUDA and one is present.
 - [ ] Profile with Nsight Systems / Nsight Compute; document each optimization
 
 ### Phase 4: advanced
-- [ ] Flash-style fused attention
+- [x] Flash-decoding attention: cached positions split into 256-token chunks across blocks, partial
+      softmax per chunk, exact merge; no context-length limit; works with CUDA graphs
+- [ ] Attention: one block per KV head group (read K/V once for all 7 query heads); tensor-core
+      FlashAttention-2 for long prompts
 - [ ] INT4 weight-only quantization
-- [ ] Continuous batching + paged KV cache
+- [x] Paged KV cache: 16-token pages from a shared pool, one page table per sequence; memory follows
+      actual lengths instead of max batch x max length
+- [x] Batched decode: one token for each of up to 64 sequences per forward pass, weights read once for
+      all of them; one CUDA graph per batch size; greedy argmax on the GPU
+- [x] Continuous batching scheduler: requests join as soon as a slot and pages are free, and leave
+      the moment they finish (`ie serve-bench`)
+- [x] Batching never changes results: batches under 32 run each row exactly as it would alone
+      (`serve-bench --check`, and a bit-for-bit test in `test-cuda`)
 - [ ] Speculative decoding
 
 ### Phase 5: present it
@@ -191,7 +211,12 @@ CUDA and one is present.
 | 2026-11-10 | GPU: hand-written CUDA kernels, BF16, RTX 4060 | 190.8 | 1752.2 | 188.5 GB/s = 87% of measured VRAM bandwidth |
 | 2026-11-11 | GPU: CUDA graphs for decode, BF16 | 213.8 | 1763.8 | 211.3 GB/s = 97% of measured VRAM bandwidth |
 | 2026-11-11 | **GPU: INT8 weights + CUDA graphs** | **361.6** | 1100.5 | 127x the Phase 1 baseline; perplexity +0.5% |
-| 2026-11-11 | GPU: tensor-core prefill, BF16, 512-token prompt | 181.9 | **5507.9** | vs 1571.7 on CUDA cores (3.5x); decode is slower at this context length, see below |
+| 2026-11-11 | GPU: tensor-core prefill, BF16, 512-token prompt | 181.9 | 5507.9 | vs 1571.7 on CUDA cores (3.5x); decode is slower at this context length, see below |
+| 2026-11-11 | GPU: flash-decoding attention, 512-token prompt | 191.4 | **7895.8** | attention spread over chunks: +5% decode, +43% prefill |
+| 2026-11-11 | GPU: flash-decoding attention, 4,000-token prompt | 184.5 | 2492.9 | 8x the context costs only 3.6% decode speed |
+| 2026-11-11 | GPU: paged KV cache, 512-token prompt | 187.8 | 7401.5 | page lookups hoisted out of the attention loop + 4 loads in flight per warp |
+| 2026-11-11 | GPU: paged KV cache, 4,000-token prompt | 174.5 | 2174.9 | single-stream cost of paging, see below |
+| 2026-11-11 | **GPU: continuous batching, 64 concurrent requests** | **1371.6** | - | total across all requests: 7.4x one at a time, output identical |
 
 Full sweep (`ie bench --sweep`, 64-token prompt, 32 generated tokens) on a Ryzen 5 3600XT
 (6 cores / 12 threads, AVX2, dual-channel DDR4) and an RTX 4060 (8 GB):
@@ -215,9 +240,43 @@ table come from an earlier run). INT8 on the GPU no longer saturates memory band
 int8 weights to floats now costs as much time as reading them, which also makes INT8 prefill slower
 than BF16. Quantizing activations too and using int8 dot-product instructions (`dp4a`) is the next step.
 
-At longer context, decode slows down (213.8 tok/s after a 64-token prompt, 181.9 after 512): the
-attention kernel loops over every cached position with one block per head, so its cost grows with
-the context. A flash-decoding style attention kernel (Phase 4) addresses this.
+At longer context, decode used to slow down (213.8 tok/s after a 64-token prompt, 181.9 after 512)
+because the first attention kernel looped over every cached position with one block per head.
+Flash-decoding attention spreads the positions over many blocks: 191.4 tok/s after 512 tokens and
+184.5 after 4,000. Prefill attention still grows with the square of the prompt length (2,493 tok/s
+for 4,000 tokens); a tensor-core FlashAttention-2 kernel is the fix.
+
+### Serving many requests (`ie serve-bench`)
+
+64 requests arrive at once (prompts of 256-512 tokens, 128-256 generated tokens each, greedy, BF16).
+Up to `Concurrency` of them run together; each decode step advances every running sequence by one
+token, finished sequences leave immediately and waiting ones join (continuous batching). `--check`
+compares every request's tokens with serving it alone.
+
+| Concurrency | Throughput tok/s | Mean time to first token | Mean latency | p95 latency | Peak KV pages | Same as one at a time |
+|------------:|-----------------:|-------------------------:|-------------:|------------:|--------------:|:---|
+| 1 | 184.8 | 32.3 s | 33.2 s | 62.7 s | 48 | 64/64 |
+| 4 | 602.7 | 9.4 s | 10.5 s | 19.4 s | 152 | 64/64 |
+| 16 | 801.8 | 6.0 s | 9.4 s | 14.9 s | 556 | 64/64 |
+| 32 | 998.1 | 3.6 s | 8.7 s | 12.0 s | 1,097 | 64/64 |
+| 64 | **1,371.6** | 1.8 s | 7.9 s | 8.9 s | 2,146 | 64/64 |
+
+Decode streams all the weights once per step whether it serves one sequence or 64, so throughput
+grows with the batch: 3.3x at 4, 7.4x at 64. It grows more slowly past 4 because each step then spends
+more of its time on attention over 64 separate caches and on prefilling new arrivals (prompts are
+prefilled on their own between decode steps; chunked prefill would overlap them). Time to first token
+drops from 32 s to 1.8 s because requests no longer queue behind each other.
+
+The KV cache is split into 16-token pages handed out as sequences grow (peak 2,146 pages = 805 MiB for
+64 sequences, instead of reserving 64 x the maximum length). Batches under 32 rows run every matmul row
+exactly as it would run alone, so batching cannot change any request's output; the tensor-core path
+used for larger batches rounds differently in the last bits, but all 64 requests still matched here.
+
+Paging is not free for a single stream: finding a position's page adds a lookup to the attention loop.
+Loading each chunk's page ids once into shared memory and keeping 4 key/value loads in flight per warp
+won most of it back. Against the contiguous cache the remaining cost is about 2% decode / 6% prefill
+at 512 tokens and 5% / 13% at 4,000, measured in different sessions, where run-to-run variation on
+this machine is a few percent.
 
 Using all 12 hardware threads helps prefill (large, compute-bound calls) but cuts decode by up to 58%.
 Decode makes ~200 small parallel calls per token and each waits for its slowest thread; with every

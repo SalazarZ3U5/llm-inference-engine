@@ -19,6 +19,12 @@ std::string device_description();
 std::unique_ptr<Runner> make_runner(const Config& cfg, const Weights& w, int max_tokens,
                                     bool use_graphs = true);
 
+// Batched serving with a paged KV cache: up to max_batch sequences of up to
+// max_seq_len tokens, sharing a page pool of about kv_bytes bytes.
+std::unique_ptr<BatchRunner> make_batch_runner(const Config& cfg, const Weights& w, int max_batch,
+                                               int max_seq_len, size_t kv_bytes,
+                                               bool use_graphs = true);
+
 // Multi-token matmuls (prefill) use tensor cores by default; switch off to compare.
 void set_tensor_cores(bool on);
 

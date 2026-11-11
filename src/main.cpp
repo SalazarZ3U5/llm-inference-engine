@@ -7,6 +7,7 @@
 //   ie test-tokenizer <model_dir> <cases.json>     check the tokenizer against Hugging Face's
 //   ie inspect  <model.safetensors>                list every tensor in a weights file
 //   ie bench    <model_dir> [--sweep]              measure prefill and decode speed
+//   ie serve-bench <model_dir> [--check]           many requests at once: continuous batching (GPU)
 //   ie perplexity <model_dir> <text_file>          measure model quality on a text
 //   ie test-kernels                                check the fast matmul kernels against the reference
 //   ie test-cuda                                   check every CUDA kernel against the CPU version
@@ -18,6 +19,8 @@
 //                      --kernel scalar|avx2 (default: avx2 if compiled in)
 // Sampling options: --temp T  --top-k K  --top-p P  --rep R  --seed S  --greedy
 //   (defaults come from the model's generation_config.json)
+// Serving options:  --requests N (default 64)  --concurrency 1,4,16,... (batch sizes to try)
+//                   --kv-gb G (KV cache budget, default 2)  --check (compare with one at a time)
 // Other options:    --max-tokens N (default 256)  --ctx N (KV cache size, default 4096)
 //                   --system "<text>" (chat)  --chat (generate)
 
@@ -82,6 +85,7 @@ void usage() {
       "  ie test-tokenizer <model_dir> <cases.json>\n"
       "  ie inspect  <model.safetensors>\n"
       "  ie bench    <model_dir> [--sweep] [--prompt-tokens N] [--gen-tokens N]\n"
+      "  ie serve-bench <model_dir> [--requests N] [--concurrency 1,4,16,32,64] [--kv-gb G] [--check]\n"
       "  ie perplexity <model_dir> <text_file>\n"
       "  ie test-kernels\n"
       "  ie test-cuda\n"
@@ -170,6 +174,11 @@ struct Options {
   std::string kernel;        // empty = default
   int prompt_tokens = 64, gen_tokens = 32;
   bool sweep = false;
+  // Serving
+  int requests = 64;
+  std::string concurrency = "1,4,16,32,64";
+  double kv_gb = 2.0;
+  bool check = false;
 };
 
 Options parse_options(const std::vector<std::string>& args, size_t first) {
@@ -199,6 +208,10 @@ Options parse_options(const std::vector<std::string>& args, size_t first) {
     else if (a == "--prompt-tokens") o.prompt_tokens = std::stoi(next());
     else if (a == "--gen-tokens") o.gen_tokens = std::stoi(next());
     else if (a == "--sweep") o.sweep = true;
+    else if (a == "--requests") o.requests = std::stoi(next());
+    else if (a == "--concurrency") o.concurrency = next();
+    else if (a == "--kv-gb") o.kv_gb = std::stod(next());
+    else if (a == "--check") o.check = true;
     else if (a.rfind("--", 0) == 0) throw std::runtime_error("unknown option " + a);
     else o.positional.push_back(a);
   }
@@ -590,6 +603,249 @@ int cmd_bench(const Options& o) {
   return 0;
 }
 
+// -------------------------------------------------------- serve-bench ----
+//
+// Serving many requests at once. All requests arrive at time 0; up to
+// `concurrency` of them are in flight. A request is admitted when a slot is
+// free and the KV cache has pages for its full length, is prefilled on its own,
+// and then joins the running batch, which advances every sequence by one token
+// per step. Finished sequences leave and free their pages at once, so the next
+// request can join mid-flight ("continuous batching") instead of the batch
+// waiting for its slowest member.
+
+struct Request {
+  std::vector<int32_t> prompt;
+  int gen = 0;  // tokens to generate (greedy, no stop token: lengths are fixed)
+};
+
+struct ServeResult {
+  std::vector<std::vector<int32_t>> out;  // generated tokens per request
+  double seconds = 0, mean_ttft = 0, mean_latency = 0, p95_latency = 0;
+  int steps = 0, peak_batch = 0, peak_pages = 0;
+  long long tokens = 0;
+};
+
+#ifdef IE_WITH_CUDA
+ServeResult serve(ie::BatchRunner& eng, const std::vector<Request>& reqs, int concurrency) {
+  const int P = eng.page_size();
+  auto pages_for = [&](const Request& r) { return (int(r.prompt.size()) + r.gen + P - 1) / P; };
+  struct Active {
+    int seq, req;
+    int32_t last;  // token to feed in the next step
+  };
+  std::vector<Active> active;
+  ServeResult res;
+  res.out.resize(reqs.size());
+  std::vector<double> ttft(reqs.size()), done(reqs.size());
+  size_t next = 0, finished = 0;
+  int reserved = 0;  // pages promised to running sequences (their full length)
+  const auto t0 = Clock::now();
+
+  while (finished < reqs.size()) {
+    // Admit waiting requests while there is a free slot and room in the cache.
+    while (next < reqs.size() && int(active.size()) < concurrency &&
+           reserved + pages_for(reqs[next]) <= eng.total_pages()) {
+      const Request& r = reqs[next];
+      const int seq = eng.open_sequence();
+      if (seq < 0) break;
+      const int32_t tok = eng.prefill_greedy(seq, r.prompt);
+      ttft[next] = seconds_since(t0);
+      res.out[next].push_back(tok);
+      if (r.gen <= 1) {
+        eng.close_sequence(seq);
+        done[next] = ttft[next];
+        ++finished;
+      } else {
+        reserved += pages_for(r);
+        active.push_back({seq, int(next), tok});
+      }
+      ++next;
+    }
+    if (active.empty()) {
+      if (finished < reqs.size() && next < reqs.size())
+        throw std::runtime_error("a request needs more KV-cache pages than the cache has (raise --kv-gb)");
+      continue;
+    }
+
+    // One decode step for every running sequence.
+    std::vector<int> seqs;
+    std::vector<int32_t> toks;
+    for (const Active& a : active) {
+      seqs.push_back(a.seq);
+      toks.push_back(a.last);
+    }
+    res.peak_batch = std::max(res.peak_batch, int(active.size()));
+    const std::vector<int32_t> nxt = eng.decode_greedy(seqs, toks);
+    ++res.steps;
+    res.peak_pages = std::max(res.peak_pages, eng.total_pages() - eng.free_pages());
+    const double now = seconds_since(t0);
+
+    std::vector<Active> still;
+    for (size_t i = 0; i < active.size(); ++i) {
+      Active a = active[i];
+      std::vector<int32_t>& o = res.out[a.req];
+      o.push_back(nxt[i]);
+      if (int(o.size()) >= reqs[a.req].gen) {  // done: leave the batch, free the pages
+        eng.close_sequence(a.seq);
+        reserved -= pages_for(reqs[a.req]);
+        done[a.req] = now;
+        ++finished;
+      } else {
+        a.last = nxt[i];
+        still.push_back(a);
+      }
+    }
+    active.swap(still);
+  }
+
+  res.seconds = seconds_since(t0);
+  for (const auto& o : res.out) res.tokens += long(o.size());
+  for (size_t i = 0; i < reqs.size(); ++i) {
+    res.mean_ttft += ttft[i] / reqs.size();
+    res.mean_latency += done[i] / reqs.size();
+  }
+  std::vector<double> lat = done;
+  std::sort(lat.begin(), lat.end());
+  res.p95_latency = lat[std::min(lat.size() - 1, size_t(0.95 * lat.size()))];
+  return res;
+}
+
+std::vector<int> parse_int_list(const std::string& s) {
+  std::vector<int> v;
+  size_t i = 0;
+  while (i < s.size()) {
+    size_t j = s.find(',', i);
+    if (j == std::string::npos) j = s.size();
+    const int n = std::stoi(s.substr(i, j - i));
+    if (n < 1) throw std::runtime_error("--concurrency values must be >= 1");
+    v.push_back(n);
+    i = j + 1;
+  }
+  if (v.empty()) throw std::runtime_error("--concurrency: empty list");
+  return v;
+}
+#endif
+
+int cmd_serve_bench(const Options& o) {
+  if (o.positional.empty()) { usage(); return 1; }
+#ifndef IE_WITH_CUDA
+  std::printf("serve-bench needs the CUDA backend (this build has none).\n");
+  return 1;
+#else
+  if (resolve_device(o.device == "auto" ? "cuda" : o.device) != "cuda")
+    throw std::runtime_error("serve-bench runs on the GPU only (--device cuda)");
+  apply_compute_options(o);
+  const fs::path model_dir = o.positional[0];
+  ie::Tokenizer tok(model_dir.string());
+  std::vector<int> levels = parse_int_list(o.concurrency);
+  const int max_batch = *std::max_element(levels.begin(), levels.end());
+
+  // Requests: different slices of the bench text, with lengths spread between
+  // half and all of --prompt-tokens / --gen-tokens, so sequences finish at
+  // different times (which is what continuous batching is for).
+  std::vector<int32_t> unit = tok.encode(kBenchText), text;
+  while (int(text.size()) < o.prompt_tokens + int(unit.size()))
+    text.insert(text.end(), unit.begin(), unit.end());
+  std::mt19937 rng(1234);
+  auto between = [&](int lo, int hi) { return std::uniform_int_distribution<int>(lo, hi)(rng); };
+  std::vector<Request> reqs(std::max(1, o.requests));
+  int longest = 0;
+  for (Request& r : reqs) {
+    const int len = between(std::max(1, o.prompt_tokens / 2), std::max(1, o.prompt_tokens));
+    const int start = between(0, int(unit.size()) - 1);
+    r.prompt.assign(text.begin() + start, text.begin() + start + len);
+    r.gen = between(std::max(1, o.gen_tokens / 2), std::max(1, o.gen_tokens));
+    longest = std::max(longest, len + r.gen);
+  }
+
+  // Load the model once, sized for the largest batch.
+  const auto t0 = Clock::now();
+  const ie::DType dtype = ie::parse_dtype(o.weights);
+  if (dtype == ie::DType::F32) throw std::runtime_error("the CUDA backend runs bf16 or int8 weights");
+  ie::Config cfg = ie::load_config((model_dir / "config.json").string());
+  std::unique_ptr<ie::BatchRunner> eng;
+  {
+    ie::SafeTensorsFile st((model_dir / "model.safetensors").string());
+    ie::Weights w = ie::load_weights(st, cfg, dtype);
+    eng = ie::cuda::make_batch_runner(cfg, w, max_batch, longest, size_t(o.kv_gb * 1073741824.0),
+                                      o.graphs);
+  }
+  std::fprintf(stderr, "[loaded as %s in %.1f s | %s]\n", ie::dtype_name(dtype), seconds_since(t0),
+               eng->device_name().c_str());
+
+  // Warm-up: a full-length prefill, then decode steps at every batch size from
+  // max_batch down to 1, so buffers are allocated and each batch size's graph
+  // is recorded before anything is timed.
+  {
+    std::vector<int> seqs;
+    for (int i = 0; i < max_batch; ++i) {
+      const int s = eng->open_sequence();
+      if (s < 0) break;
+      if (i == 0) eng->prefill_greedy(s, std::vector<int32_t>(text.begin(), text.begin() + o.prompt_tokens));
+      else eng->prefill_greedy(s, {text[i % text.size()]});
+      seqs.push_back(s);
+    }
+    while (!seqs.empty()) {
+      eng->decode_greedy(seqs, std::vector<int32_t>(seqs.size(), text[0]));
+      eng->close_sequence(seqs.back());
+      seqs.pop_back();
+    }
+  }
+
+  const int min_prompt = std::max(1, o.prompt_tokens / 2), min_gen = std::max(1, o.gen_tokens / 2);
+  std::printf("%d requests, prompts %d-%d tokens, generating %d-%d tokens each (greedy), %s weights\n",
+              int(reqs.size()), min_prompt, std::max(1, o.prompt_tokens), min_gen,
+              std::max(1, o.gen_tokens), ie::dtype_name(dtype));
+  std::printf("KV cache: %d pages of %d tokens (%.0f MiB), up to %d sequences at once\n\n",
+              eng->total_pages(), eng->page_size(), eng->kv_cache_bytes() / 1048576.0, max_batch);
+
+  // The reference for --check: every request run alone (concurrency 1).
+  std::optional<ServeResult> ref;
+  if (o.check && std::find(levels.begin(), levels.end(), 1) == levels.end())
+    ref = serve(*eng, reqs, 1);
+
+  std::printf("| Concurrency | Peak batch | Steps | Time s | Throughput tok/s | Mean TTFT ms | Mean latency ms | p95 latency ms | Peak KV pages |%s\n",
+              o.check ? " Same as one at a time |" : "");
+  std::printf("|------------:|-----------:|------:|-------:|-----------------:|-------------:|----------------:|---------------:|--------------:|%s\n",
+              o.check ? ":---|" : "");
+  bool all_same = true;
+  for (int c : levels) {
+    ServeResult r = serve(*eng, reqs, c);
+    if (c == 1 && o.check && !ref) ref = r;
+    std::string match;
+    if (o.check) {
+      int same = 0, first_diff = -1, diff_req = -1;
+      for (size_t i = 0; i < reqs.size(); ++i) {
+        if (r.out[i] == ref->out[i]) { ++same; continue; }
+        if (diff_req < 0) {
+          diff_req = int(i);
+          first_diff = 0;
+          while (first_diff < int(r.out[i].size()) && r.out[i][first_diff] == ref->out[i][first_diff]) ++first_diff;
+        }
+      }
+      char buf[160];
+      if (same == int(reqs.size())) {
+        std::snprintf(buf, sizeof(buf), " %d/%d identical |", same, int(reqs.size()));
+      } else {
+        all_same = false;
+        std::snprintf(buf, sizeof(buf), " %d/%d identical (request %d differs from token %d) |", same,
+                      int(reqs.size()), diff_req, first_diff);
+      }
+      match = buf;
+    }
+    std::printf("| %d | %d | %d | %.2f | %.1f | %.1f | %.1f | %.1f | %d |%s\n", c, r.peak_batch, r.steps,
+                r.seconds, r.tokens / r.seconds, r.mean_ttft * 1e3, r.mean_latency * 1e3,
+                r.p95_latency * 1e3, r.peak_pages, match.c_str());
+    std::fflush(stdout);
+  }
+  if (o.check && !all_same && o.tensor_cores && max_batch >= 32)
+    std::printf("\nnote: batches of 32+ tokens use tensor cores, which round differently in the last bits;\n"
+                "      a near-tie between two tokens can then go the other way. --no-tensor-cores keeps\n"
+                "      every batch size bit-exact.\n");
+  return o.check && !all_same ? 2 : 0;
+#endif
+}
+
 // --------------------------------------------------------- perplexity ----
 
 // Perplexity = exp(average negative log-likelihood of each next token).
@@ -875,6 +1131,7 @@ int main(int argc, char** argv) {
     if (cmd == "test-tokenizer") return cmd_test_tokenizer(o);
     if (cmd == "inspect") return cmd_inspect(o);
     if (cmd == "bench") return cmd_bench(o);
+    if (cmd == "serve-bench") return cmd_serve_bench(o);
     if (cmd == "perplexity") return cmd_perplexity(o);
     if (cmd == "test-kernels") return cmd_test_kernels(o);
     if (cmd == "test-cuda") return cmd_test_cuda(o);

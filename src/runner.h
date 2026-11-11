@@ -42,4 +42,41 @@ class Runner {
 // The CPU implementation (Model + KVCache from Phases 0-2).
 std::unique_ptr<Runner> make_cpu_runner(Config cfg, Weights w, int max_tokens);
 
+// Serves many sequences at once from one copy of the weights (GPU only).
+//
+// Each sequence's KV cache lives in fixed-size pages taken from a shared pool
+// as it grows and returned when it is closed, so memory follows the actual
+// lengths instead of max_batch x max_seq_len. A decode step runs one new token
+// for each of several sequences in a single forward pass: the weights are read
+// once for all of them, which is where batching gets its throughput.
+class BatchRunner {
+ public:
+  virtual ~BatchRunner() = default;
+
+  virtual int open_sequence() = 0;           // returns a sequence id, or -1 if all slots are busy
+  virtual void close_sequence(int seq) = 0;  // frees its pages
+  virtual int sequence_length(int seq) const = 0;
+
+  // Appends a prompt to one sequence; returns the logits [vocab] of its last token.
+  virtual std::vector<float> prefill(int seq, const std::vector<int32_t>& ids) = 0;
+  // One new token for each listed sequence; returns logits [n, vocab].
+  virtual std::vector<float> decode(const std::vector<int>& seqs,
+                                    const std::vector<int32_t>& tokens) = 0;
+  // Greedy versions: the argmax is taken on the GPU, so only token ids come back.
+  virtual int32_t prefill_greedy(int seq, const std::vector<int32_t>& ids) = 0;
+  virtual std::vector<int32_t> decode_greedy(const std::vector<int>& seqs,
+                                             const std::vector<int32_t>& tokens) = 0;
+
+  virtual int max_batch() const = 0;     // sequences that can be open at once
+  virtual int max_seq_len() const = 0;   // tokens per sequence
+  virtual int page_size() const = 0;     // tokens per KV page
+  virtual int total_pages() const = 0;
+  virtual int free_pages() const = 0;
+
+  virtual const Config& config() const = 0;
+  virtual std::string device_name() const = 0;
+  virtual size_t weight_bytes() const = 0;
+  virtual size_t kv_cache_bytes() const = 0;
+};
+
 }  // namespace ie

@@ -6,6 +6,8 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <map>
+#include <numeric>
 #include <random>
 #include <stdexcept>
 #include <string>
@@ -14,6 +16,7 @@
 #include "cuda/kernels.cuh"
 #include "npy.h"
 #include "ops.h"
+#include "sampler.h"
 
 // NVTX: named ranges that show up on the Nsight Systems timeline ("prefill",
 // "decode", ...). Header-only, and costs nothing when no profiler is attached.
@@ -30,6 +33,8 @@ namespace ie::cuda {
 
 namespace {
 
+constexpr int kPageSize = kKvPageSize;  // tokens per KV-cache page (16)
+
 struct NvtxRange {
   explicit NvtxRange(const char* name) { IE_NVTX_PUSH(name); }
   ~NvtxRange() { IE_NVTX_POP(); }
@@ -40,7 +45,7 @@ void check(cudaError_t err, const char* what) {
     throw std::runtime_error(std::string("CUDA error in ") + what + ": " + cudaGetErrorString(err));
 }
 
-// Owns every device allocation of one runner and frees them together.
+// Owns every device allocation of one engine and frees them together.
 class DeviceMemory {
  public:
   ~DeviceMemory() {
@@ -94,7 +99,7 @@ template <class T>
 class PinnedBuffer {
  public:
   ~PinnedBuffer() { reset(); }
-  void resize(size_t n) {
+  void resize(size_t n) {  // grows only; contents are not preserved
     if (n <= n_) return;
     reset();
     void* p = nullptr;
@@ -122,15 +127,28 @@ struct DeviceLayer {
   DeviceMatrix w_gate, w_up, w_down;
 };
 
-class CudaRunner : public Runner {
+// One sequence's view of the paged KV cache.
+struct Sequence {
+  bool open = false;
+  int len = 0;             // tokens cached
+  std::vector<int> pages;  // page ids, in order
+};
+
+// The GPU engine. Every forward pass is a list of token rows, each with its own
+// sequence and position, so the same code serves:
+//   - Runner (chat, generate, verify, bench): one sequence, id 0;
+//   - BatchRunner (serve-bench): many sequences, prefilled one at a time and
+//     then decoded together, one token each per step.
+class CudaEngine final : public Runner, public BatchRunner {
  public:
-  CudaRunner(const Config& cfg, const Weights& w, int max_tokens, bool use_graphs)
-      : cfg_(cfg), max_tokens_(max_tokens), use_graphs_(use_graphs), dtype_(w.dtype) {
+  CudaEngine(const Config& cfg, const Weights& w, int max_batch, int max_seq_len, int num_pages,
+             bool use_graphs)
+      : cfg_(cfg), max_batch_(max_batch), max_seq_len_(max_seq_len), num_pages_(num_pages),
+        max_pages_per_seq_((max_seq_len + kPageSize - 1) / kPageSize), use_graphs_(use_graphs),
+        dtype_(w.dtype), seqs_(max_batch) {
     if (w.dtype != DType::BF16 && w.dtype != DType::I8)
       throw std::runtime_error("the CUDA backend runs bf16 or int8 weights (not f32)");
-    if (max_tokens > attention_max_tokens())
-      throw std::runtime_error("--ctx " + std::to_string(max_tokens) + " is larger than the GPU attention kernel supports (" +
-                               std::to_string(attention_max_tokens()) + ")");
+    if (num_pages < 1) throw std::runtime_error("KV cache: no pages");
     cudaDeviceProp prop{};
     check(cudaGetDeviceProperties(&prop, 0), "cudaGetDeviceProperties");
     name_ = std::string("cuda, ") + prop.name + (use_graphs_ ? ", graphs" : ", no graphs");
@@ -166,62 +184,91 @@ class CudaRunner : public Runner {
       inv_freq[i] = 1.0f / std::pow(cfg_.rope_theta, float(2 * i) / float(cfg_.head_dim));
     inv_freq_ = mem_.upload(inv_freq);
 
-    // KV cache: [layer][position][kv_dim] for keys and for values.
-    const size_t per_layer = size_t(max_tokens_) * cfg_.kv_dim();
-    k_cache_ = mem_.alloc<float>(per_layer * cfg_.num_layers);
-    v_cache_ = mem_.alloc<float>(per_layer * cfg_.num_layers);
-    kv_bytes_ = 2 * per_layer * cfg_.num_layers * sizeof(float);
+    // Paged KV cache: per layer, a pool of num_pages pages of kPageSize rows.
+    const size_t layer_floats = size_t(num_pages_) * kPageSize * cfg_.kv_dim();
+    k_pool_ = mem_.alloc<float>(layer_floats * cfg_.num_layers);
+    v_pool_ = mem_.alloc<float>(layer_floats * cfg_.num_layers);
+    kv_bytes_ = 2 * layer_floats * cfg_.num_layers * sizeof(float);
+    for (int p = num_pages_ - 1; p >= 0; --p) free_pages_.push_back(p);
 
-    pos_ = mem_.alloc<int>(1);
-    h_pos_.resize(1);
+    // Page tables, one row per sequence slot, mirrored in pinned host memory.
+    const size_t table_ints = size_t(max_batch_) * max_pages_per_seq_;
+    tables_ = mem_.alloc<int>(table_ints);
+    h_tables_.resize(table_ints);
+    std::fill(h_tables_.data(), h_tables_.data() + table_ints, 0);
+    tables_dirty_ = true;
   }
 
-  ~CudaRunner() override {
-    drop_graph();
+  ~CudaEngine() override {
+    drop_graphs();
     if (stream_) cudaStreamDestroy(stream_);
   }
 
+  // ---------------------------------------------------------- Runner ----
+  // (one sequence: id 0, opened on first use)
+
   std::vector<float> forward(const std::vector<int32_t>& ids, bool all_logits,
                              const StageCallback& on_stage) override {
-    const int T = int(ids.size()), V = cfg_.vocab_size;
-    if (T == 0) throw std::runtime_error("forward: no tokens");
-    if (len_ + T > max_tokens_)
-      throw std::runtime_error("forward: KV cache full (" + std::to_string(max_tokens_) + " tokens)");
-    for (int32_t id : ids)
-      if (id < 0 || id >= V) throw std::runtime_error("token id out of range");
-    const int logit_rows = all_logits ? T : 1;
-    NvtxRange range(T == 1 ? "decode" : "prefill");
-    reserve(T, logit_rows);  // before any capture: no allocations allowed inside a graph
+    if (!seqs_[0].open) open_slot(0);
+    const int T = int(ids.size()), start = seqs_[0].len;
+    std::vector<int> rows_seq(T, 0), rows_pos(T), logit_rows;
+    for (int i = 0; i < T; ++i) rows_pos[i] = start + i;
+    if (all_logits) {
+      logit_rows.resize(T);
+      std::iota(logit_rows.begin(), logit_rows.end(), 0);
+    } else {
+      logit_rows = {T - 1};
+    }
+    const bool graph = T == 1 && !all_logits && !on_stage;
+    Output out = run(ids, rows_seq, rows_pos, logit_rows, graph, false, on_stage ? &on_stage : nullptr);
+    seqs_[0].len += T;
+    return std::move(out.logits);
+  }
+  void reset() override {
+    if (seqs_[0].open) close_sequence(0);
+  }
+  int position() const override { return seqs_[0].len; }
+  int max_tokens() const override { return max_seq_len_; }
 
-    // A decode step (1 token, no inspection) replays the recorded graph.
-    const bool use_graph = use_graphs_ && T == 1 && !all_logits && !on_stage;
-    if (use_graph && !graph_) capture_decode_graph();
+  // ----------------------------------------------------- BatchRunner ----
 
-    // Inputs: the token ids and the current position, read by the kernels from VRAM.
-    std::memcpy(h_ids_.data(), ids.data(), sizeof(int32_t) * T);
-    *h_pos_.data() = len_;
-    check(cudaMemcpyAsync(ids_, h_ids_.data(), sizeof(int32_t) * T, cudaMemcpyHostToDevice, stream_), "ids");
-    check(cudaMemcpyAsync(pos_, h_pos_.data(), sizeof(int), cudaMemcpyHostToDevice, stream_), "pos");
+  int open_sequence() override {
+    for (int s = 0; s < max_batch_; ++s)
+      if (!seqs_[s].open) {
+        open_slot(s);
+        return s;
+      }
+    return -1;
+  }
+  void close_sequence(int seq) override {
+    Sequence& sq = slot(seq);
+    for (int p : sq.pages) free_pages_.push_back(p);
+    sq = Sequence{};
+  }
+  int sequence_length(int seq) const override { return seqs_.at(seq).len; }
 
-    if (use_graph)
-      check(cudaGraphLaunch(graph_, stream_), "cudaGraphLaunch");  // ~243 kernels, one call
-    else
-      enqueue(T, logit_rows, on_stage ? &on_stage : nullptr);
-
-    const size_t n = size_t(logit_rows) * V;
-    check(cudaMemcpyAsync(h_logits_.data(), logits_, n * sizeof(float), cudaMemcpyDeviceToHost, stream_), "logits");
-    // Waits for everything queued above; errors from inside kernels surface here.
-    check(cudaStreamSynchronize(stream_), "forward");
-    len_ += T;
-
-    std::vector<float> out(h_logits_.data(), h_logits_.data() + n);
-    if (on_stage) on_stage("logits", out.data(), logit_rows, V);
-    return out;
+  std::vector<float> prefill(int seq, const std::vector<int32_t>& ids) override {
+    return std::move(run_prefill(seq, ids, false).logits);
+  }
+  int32_t prefill_greedy(int seq, const std::vector<int32_t>& ids) override {
+    return run_prefill(seq, ids, true).tokens.at(0);
+  }
+  std::vector<float> decode(const std::vector<int>& seqs, const std::vector<int32_t>& tokens) override {
+    return std::move(run_decode(seqs, tokens, false).logits);
+  }
+  std::vector<int32_t> decode_greedy(const std::vector<int>& seqs,
+                                     const std::vector<int32_t>& tokens) override {
+    return std::move(run_decode(seqs, tokens, true).tokens);
   }
 
-  void reset() override { len_ = 0; }
-  int position() const override { return len_; }
-  int max_tokens() const override { return max_tokens_; }
+  int max_batch() const override { return max_batch_; }
+  int max_seq_len() const override { return max_seq_len_; }
+  int page_size() const override { return kPageSize; }
+  int total_pages() const override { return num_pages_; }
+  int free_pages() const override { return int(free_pages_.size()); }
+
+  // ------------------------------------------------------------ both ----
+
   const Config& config() const override { return cfg_; }
   std::string device_name() const override { return name_; }
   DType weight_dtype() const override { return dtype_; }
@@ -230,11 +277,127 @@ class CudaRunner : public Runner {
   size_t kv_cache_bytes() const override { return kv_bytes_; }
 
  private:
-  // Queues the whole forward pass for T tokens on stream_. Used directly for
-  // prefill, and recorded once (T = 1) into the decode graph.
-  void enqueue(int T, int logit_rows, const StageCallback* on_stage) {
+  struct Output {
+    std::vector<float> logits;   // [logit rows, vocab]   (unless greedy)
+    std::vector<int32_t> tokens;  // [logit rows]          (greedy)
+  };
+
+  Sequence& slot(int seq) {
+    if (seq < 0 || seq >= max_batch_ || !seqs_[seq].open)
+      throw std::runtime_error("invalid or closed sequence id " + std::to_string(seq));
+    return seqs_[seq];
+  }
+  void open_slot(int s) {
+    seqs_[s] = Sequence{};
+    seqs_[s].open = true;
+  }
+
+  // Makes sure `seq` has pages for positions 0..len-1, taking pages from the pool.
+  void ensure_pages(int seq, int len) {
+    Sequence& sq = slot(seq);
+    if (len > max_seq_len_)
+      throw std::runtime_error("sequence longer than the maximum (" + std::to_string(max_seq_len_) + " tokens)");
+    while (int(sq.pages.size()) * kPageSize < len) {
+      if (free_pages_.empty()) throw std::runtime_error("KV cache full: no free pages");
+      const int page = free_pages_.back();
+      free_pages_.pop_back();
+      h_tables_.data()[size_t(seq) * max_pages_per_seq_ + sq.pages.size()] = page;
+      sq.pages.push_back(page);
+      tables_dirty_ = true;
+    }
+  }
+
+  Output run_prefill(int seq, const std::vector<int32_t>& ids, bool greedy) {
+    Sequence& sq = slot(seq);
+    const int T = int(ids.size());
+    std::vector<int> rows_seq(T, seq), rows_pos(T);
+    for (int i = 0; i < T; ++i) rows_pos[i] = sq.len + i;
+    Output out = run(ids, rows_seq, rows_pos, {T - 1}, /*graph=*/T == 1, greedy, nullptr);
+    sq.len += T;
+    return out;
+  }
+
+  Output run_decode(const std::vector<int>& seqs, const std::vector<int32_t>& tokens, bool greedy) {
+    const int n = int(seqs.size());
+    if (n != int(tokens.size())) throw std::runtime_error("decode: one token per sequence");
+    std::vector<int> rows_pos(n), logit_rows(n);
+    for (int i = 0; i < n; ++i) {
+      rows_pos[i] = slot(seqs[i]).len;
+      logit_rows[i] = i;
+    }
+    Output out = run(tokens, seqs, rows_pos, logit_rows, /*graph=*/true, greedy, nullptr);
+    for (int s : seqs) seqs_[s].len += 1;
+    return out;
+  }
+
+  // The core: one forward pass over `ids`, row t belonging to sequence
+  // rows_seq[t] at position rows_pos[t]. Logits (or their argmax) come back for
+  // the rows listed in logit_rows. `graph`: this is a pure decode step (one
+  // token per sequence, logits for every row), which can replay a recording.
+  Output run(const std::vector<int32_t>& ids, const std::vector<int>& rows_seq,
+             const std::vector<int>& rows_pos, const std::vector<int>& logit_rows, bool graph,
+             bool greedy, const StageCallback* on_stage) {
+    const int T = int(ids.size()), R = int(logit_rows.size()), V = cfg_.vocab_size;
+    if (T == 0) throw std::runtime_error("forward: no tokens");
+    for (int32_t id : ids)
+      if (id < 0 || id >= V) throw std::runtime_error("token id out of range");
+    NvtxRange range(T == R ? (T == 1 ? "decode" : "decode batch") : "prefill");
+
+    int max_pos = 0;
+    for (int t = 0; t < T; ++t) {
+      ensure_pages(rows_seq[t], rows_pos[t] + 1);
+      max_pos = std::max(max_pos, rows_pos[t]);
+    }
+    graph = graph && use_graphs_ && !on_stage;
+    // Attention chunks: a recorded graph must cover any position a sequence can
+    // reach; a direct launch only needs the context it actually has.
+    const int chunks = attention_chunks(graph ? max_seq_len_ : max_pos + 1);
+    reserve(T, R, chunks);  // before any capture: no allocations allowed inside a graph
+    if (graph && !graphs_.count(T)) capture_graph(T, chunks);
+
+    // Inputs, read by the kernels from VRAM.
+    std::memcpy(h_ids_.data(), ids.data(), sizeof(int32_t) * T);
+    std::memcpy(h_row_seq_.data(), rows_seq.data(), sizeof(int) * T);
+    std::memcpy(h_row_pos_.data(), rows_pos.data(), sizeof(int) * T);
+    std::memcpy(h_logit_rows_.data(), logit_rows.data(), sizeof(int) * R);
+    check(cudaMemcpyAsync(ids_, h_ids_.data(), sizeof(int32_t) * T, cudaMemcpyHostToDevice, stream_), "ids");
+    check(cudaMemcpyAsync(row_seq_, h_row_seq_.data(), sizeof(int) * T, cudaMemcpyHostToDevice, stream_), "row_seq");
+    check(cudaMemcpyAsync(row_pos_, h_row_pos_.data(), sizeof(int) * T, cudaMemcpyHostToDevice, stream_), "row_pos");
+    check(cudaMemcpyAsync(logit_rows_, h_logit_rows_.data(), sizeof(int) * R, cudaMemcpyHostToDevice, stream_), "logit_rows");
+    if (tables_dirty_) {  // only after a sequence gained or lost a page
+      const size_t n = size_t(max_batch_) * max_pages_per_seq_;
+      check(cudaMemcpyAsync(tables_, h_tables_.data(), n * sizeof(int), cudaMemcpyHostToDevice, stream_), "tables");
+      tables_dirty_ = false;
+    }
+
+    if (graph)
+      check(cudaGraphLaunch(graphs_.at(T), stream_), "cudaGraphLaunch");  // the whole step, one call
+    else
+      enqueue(T, R, chunks, on_stage);
+
+    Output out;
+    if (greedy) {
+      argmax_rows(argmax_, logits_, R, V, stream_);
+      check(cudaMemcpyAsync(h_argmax_.data(), argmax_, sizeof(int32_t) * R, cudaMemcpyDeviceToHost, stream_), "argmax");
+    } else {
+      check(cudaMemcpyAsync(h_logits_.data(), logits_, size_t(R) * V * sizeof(float), cudaMemcpyDeviceToHost, stream_), "logits");
+    }
+    // Waits for everything queued above; errors from inside kernels surface here.
+    check(cudaStreamSynchronize(stream_), "forward");
+    if (greedy) {
+      out.tokens.assign(h_argmax_.data(), h_argmax_.data() + R);
+    } else {
+      out.logits.assign(h_logits_.data(), h_logits_.data() + size_t(R) * V);
+      if (on_stage) (*on_stage)("logits", out.logits.data(), R, V);
+    }
+    return out;
+  }
+
+  // Queues the whole forward pass for T rows on stream_. Used directly for
+  // prefill, and recorded once per batch size into a decode graph.
+  void enqueue(int T, int R, int chunks, const StageCallback* on_stage) {
     const int H = cfg_.hidden_size, NH = cfg_.num_heads, NKV = cfg_.num_kv_heads;
-    const int HD = cfg_.head_dim, KVD = cfg_.kv_dim();
+    const int HD = cfg_.head_dim;
     auto stage = [&](const char* name, const float* d, int cols) {
       if (!on_stage) return;
       std::vector<float> h(size_t(T) * cols);
@@ -242,23 +405,28 @@ class CudaRunner : public Runner {
       check(cudaStreamSynchronize(stream_), "stage copy");
       (*on_stage)(name, h.data(), T, cols);
     };
+    KvLayout kv;
+    kv.tables = tables_;
+    kv.max_pages = max_pages_per_seq_;
+    kv.page_size = kPageSize;
+    const size_t pool_stride = size_t(num_pages_) * kPageSize * cfg_.kv_dim();
 
     embedding(x_, ids_, embed_, T, stream_);
     stage("embed", x_, H);
 
-    const size_t cache_stride = size_t(max_tokens_) * KVD;
     for (int l = 0; l < cfg_.num_layers; ++l) {
       const DeviceLayer& L = layers_[l];
-      float* kc = k_cache_ + l * cache_stride;
-      float* vc = v_cache_ + l * cache_stride;
+      float* kp = k_pool_ + l * pool_stride;
+      float* vp = v_pool_ + l * pool_stride;
 
       // attention block: x += o_proj(attention(rope(q), rope(k), v))
       rmsnorm(xn_, x_, L.input_norm, T, H, cfg_.rms_norm_eps, stream_);
       matmul(q_, xn_, L.wq, L.bq, T, false, stream_);
       matmul(k_, xn_, L.wk, L.bk, T, false, stream_);
       matmul(v_, xn_, L.wv, L.bv, T, false, stream_);
-      rope_and_cache(q_, k_, v_, kc, vc, inv_freq_, T, pos_, NH, NKV, HD, stream_);
-      attention(attn_, q_, kc, vc, T, pos_, max_tokens_, NH, NKV, HD, stream_);
+      rope_and_cache(q_, k_, v_, kp, vp, inv_freq_, T, row_pos_, row_seq_, kv, NH, NKV, HD, stream_);
+      attention(attn_, q_, kp, vp, T, row_pos_, row_seq_, kv, chunks, part_o_, part_ml_, NH, NKV, HD,
+                stream_);
       matmul(x_, attn_, L.wo, nullptr, T, /*accumulate=*/true, stream_);
 
       // MLP block: x += down(silu(gate(xn)) * up(xn))
@@ -275,45 +443,52 @@ class CudaRunner : public Runner {
 
     rmsnorm(xn_, x_, final_norm_, T, H, cfg_.rms_norm_eps, stream_);
     stage("final_norm", xn_, H);
-    matmul(logits_, xn_ + size_t(T - logit_rows) * H, lm_head_, nullptr, logit_rows, false, stream_);
+    // Only the rows that need logits go through the 151,936-row LM head.
+    gather_rows(xg_, xn_, logit_rows_, R, H, stream_);
+    matmul(logits_, xg_, lm_head_, nullptr, R, false, stream_);
   }
 
-  // Records one decode step's kernel launches into a CUDA graph. Replaying it
-  // costs a single launch instead of ~243, which matters most on Windows, where
-  // each individual launch has noticeable driver overhead.
-  void capture_decode_graph() {
+  // Records one decode step for a batch of T sequences into a CUDA graph.
+  // Replaying it costs a single launch instead of ~250, which matters most on
+  // Windows, where each individual launch has noticeable driver overhead.
+  void capture_graph(int T, int chunks) {
     NvtxRange range("capture decode graph");
     cudaGraph_t graph = nullptr;
     check(cudaStreamBeginCapture(stream_, cudaStreamCaptureModeThreadLocal), "cudaStreamBeginCapture");
     try {
-      enqueue(1, 1, nullptr);
+      enqueue(T, T, chunks, nullptr);
     } catch (...) {
       cudaStreamEndCapture(stream_, &graph);
       if (graph) cudaGraphDestroy(graph);
       throw;
     }
     check(cudaStreamEndCapture(stream_, &graph), "cudaStreamEndCapture");
-    cudaError_t err = cudaGraphInstantiate(&graph_, graph, 0);
+    cudaGraphExec_t exec = nullptr;
+    cudaError_t err = cudaGraphInstantiate(&exec, graph, 0);
     cudaGraphDestroy(graph);
     check(err, "cudaGraphInstantiate");
+    graphs_[T] = exec;
   }
 
-  void drop_graph() {
-    if (graph_) cudaGraphExecDestroy(graph_);
-    graph_ = nullptr;
+  void drop_graphs() {
+    for (auto& g : graphs_) cudaGraphExecDestroy(g.second);
+    graphs_.clear();
   }
 
-  // Scratch buffers sized for T tokens, grown on demand. A recorded graph holds
-  // the old buffer addresses, so it must be re-recorded after any reallocation.
-  void reserve(int T, int logit_rows) {
-    if (T > cap_tokens_) {
-      drop_graph();
-      for (void* p : {(void*)ids_, (void*)x_, (void*)xn_, (void*)q_, (void*)k_, (void*)v_,
-                      (void*)attn_, (void*)mid_})
+  // Scratch buffers sized for T rows, R logit rows and the attention chunks,
+  // grown on demand. Recorded graphs hold the old buffer addresses, so they are
+  // dropped after any reallocation and re-recorded when next needed.
+  void reserve(int T, int R, int chunks) {
+    if (T > cap_rows_) {
+      drop_graphs();
+      for (void* p : {(void*)ids_, (void*)row_seq_, (void*)row_pos_, (void*)x_, (void*)xn_, (void*)q_,
+                      (void*)k_, (void*)v_, (void*)attn_, (void*)mid_})
         mem_.release(p);
-      cap_tokens_ = std::max(T, 16);
-      const size_t n = size_t(cap_tokens_);
+      cap_rows_ = std::max(T, 16);
+      const size_t n = size_t(cap_rows_);
       ids_ = mem_.alloc<int32_t>(n);
+      row_seq_ = mem_.alloc<int>(n);
+      row_pos_ = mem_.alloc<int>(n);
       x_ = mem_.alloc<float>(n * cfg_.hidden_size);
       xn_ = mem_.alloc<float>(n * cfg_.hidden_size);
       q_ = mem_.alloc<float>(n * cfg_.q_dim());
@@ -322,41 +497,72 @@ class CudaRunner : public Runner {
       attn_ = mem_.alloc<float>(n * cfg_.q_dim());
       mid_ = mem_.alloc<float>(n * cfg_.intermediate_size);
       h_ids_.resize(n);
+      h_row_seq_.resize(n);
+      h_row_pos_.resize(n);
     }
-    if (logit_rows > cap_logit_rows_) {
-      drop_graph();
-      mem_.release(logits_);
-      cap_logit_rows_ = logit_rows;
-      logits_ = mem_.alloc<float>(size_t(logit_rows) * cfg_.vocab_size);
-      h_logits_.resize(size_t(logit_rows) * cfg_.vocab_size);
+    if (R > cap_logit_rows_) {
+      drop_graphs();
+      for (void* p : {(void*)logit_rows_, (void*)xg_, (void*)logits_, (void*)argmax_}) mem_.release(p);
+      cap_logit_rows_ = std::max(R, max_batch_);
+      const size_t r = size_t(cap_logit_rows_);
+      logit_rows_ = mem_.alloc<int>(r);
+      xg_ = mem_.alloc<float>(r * cfg_.hidden_size);
+      logits_ = mem_.alloc<float>(r * cfg_.vocab_size);
+      argmax_ = mem_.alloc<int32_t>(r);
+      h_logit_rows_.resize(r);
+      h_logits_.resize(r * cfg_.vocab_size);
+      h_argmax_.resize(r);
+    }
+    // Per-chunk partial attention results: one slot per (row, head, chunk).
+    const size_t slots = size_t(T) * cfg_.num_heads * chunks;
+    if (slots > cap_attn_slots_) {
+      drop_graphs();
+      mem_.release(part_o_);
+      mem_.release(part_ml_);
+      cap_attn_slots_ = slots;
+      part_o_ = mem_.alloc<float>(slots * cfg_.head_dim);
+      part_ml_ = mem_.alloc<float>(slots * 2);
     }
   }
 
   Config cfg_;
-  int max_tokens_ = 0, len_ = 0;
+  int max_batch_ = 1, max_seq_len_ = 0, num_pages_ = 0, max_pages_per_seq_ = 0;
   bool use_graphs_ = true;
   DType dtype_;
   std::string name_;
   size_t weight_bytes_ = 0, num_params_ = 0, kv_bytes_ = 0;
   DeviceMemory mem_;
   cudaStream_t stream_ = nullptr;
-  cudaGraphExec_t graph_ = nullptr;
+  std::map<int, cudaGraphExec_t> graphs_;  // decode graphs by batch size
 
   DeviceMatrix embed_, lm_head_;
   float* final_norm_ = nullptr;
   std::vector<DeviceLayer> layers_;
   float* inv_freq_ = nullptr;
-  float *k_cache_ = nullptr, *v_cache_ = nullptr;
-  int* pos_ = nullptr;
 
-  int cap_tokens_ = 0, cap_logit_rows_ = 0;
+  // Paged KV cache
+  float *k_pool_ = nullptr, *v_pool_ = nullptr;  // [layer][page][row][kv_dim]
+  int* tables_ = nullptr;                        // [sequence][page index] -> page id
+  PinnedBuffer<int> h_tables_;
+  bool tables_dirty_ = true;
+  std::vector<int> free_pages_;
+  std::vector<Sequence> seqs_;
+
+  // Scratch
+  int cap_rows_ = 0, cap_logit_rows_ = 0;
+  size_t cap_attn_slots_ = 0;
   int32_t* ids_ = nullptr;
+  int *row_seq_ = nullptr, *row_pos_ = nullptr, *logit_rows_ = nullptr;
   float *x_ = nullptr, *xn_ = nullptr, *q_ = nullptr, *k_ = nullptr, *v_ = nullptr;
-  float *attn_ = nullptr, *mid_ = nullptr, *logits_ = nullptr;
-  PinnedBuffer<int32_t> h_ids_;
-  PinnedBuffer<int> h_pos_;
+  float *attn_ = nullptr, *mid_ = nullptr, *xg_ = nullptr, *logits_ = nullptr;
+  int32_t* argmax_ = nullptr;
+  float *part_o_ = nullptr, *part_ml_ = nullptr;  // flash-decoding partial results
+  PinnedBuffer<int32_t> h_ids_, h_argmax_;
+  PinnedBuffer<int> h_row_seq_, h_row_pos_, h_logit_rows_;
   PinnedBuffer<float> h_logits_;
 };
+
+int pages_for(int tokens) { return (tokens + kPageSize - 1) / kPageSize; }
 
 }  // namespace
 
@@ -379,7 +585,18 @@ void set_tensor_cores(bool on) { ie::cuda::set_tensor_cores_impl(on); }
 
 std::unique_ptr<Runner> make_runner(const Config& cfg, const Weights& w, int max_tokens,
                                     bool use_graphs) {
-  return std::make_unique<CudaRunner>(cfg, w, max_tokens, use_graphs);
+  return std::make_unique<CudaEngine>(cfg, w, /*max_batch=*/1, max_tokens, pages_for(max_tokens),
+                                      use_graphs);
+}
+
+std::unique_ptr<BatchRunner> make_batch_runner(const Config& cfg, const Weights& w, int max_batch,
+                                               int max_seq_len, size_t kv_bytes, bool use_graphs) {
+  const size_t page_bytes = size_t(2) * kPageSize * cfg.kv_dim() * sizeof(float) * cfg.num_layers;
+  // Enough pages for the byte budget, but never more than every sequence at full length.
+  const size_t want = std::max<size_t>(1, kv_bytes / page_bytes);
+  const size_t most = size_t(max_batch) * pages_for(max_seq_len);
+  return std::make_unique<CudaEngine>(cfg, w, max_batch, max_seq_len, int(std::min(want, most)),
+                                      use_graphs);
 }
 
 // ---------------------------------------------------------- self-test ----
@@ -420,6 +637,37 @@ struct Tally {
       std::printf("FAIL %-44s rel_err %.3e (worst at index %zu)\n", what, r.rel_err, r.worst_index);
     }
   }
+  void add_exact(const char* what, bool ok) {
+    ++tests;
+    if (!ok) {
+      ++failures;
+      std::printf("FAIL %s\n", what);
+    }
+  }
+};
+
+// A paged cache for tests: `lens[s]` positions per sequence, pages handed out in
+// a shuffled order so that no sequence is contiguous.
+struct TestPages {
+  int page_size = 16, max_pages = 0, num_pages = 0;
+  std::vector<int> tables;  // [seq * max_pages + i]
+  TestPages(const std::vector<int>& lens, std::mt19937& rng) {
+    for (int len : lens) {
+      max_pages = std::max(max_pages, (len + page_size - 1) / page_size);
+      num_pages += (len + page_size - 1) / page_size;
+    }
+    std::vector<int> order(num_pages);
+    std::iota(order.begin(), order.end(), 0);
+    std::shuffle(order.begin(), order.end(), rng);
+    tables.assign(lens.size() * size_t(max_pages), 0);
+    int next = 0;
+    for (size_t s = 0; s < lens.size(); ++s)
+      for (int i = 0; i < (lens[s] + page_size - 1) / page_size; ++i)
+        tables[s * max_pages + i] = order[next++];
+  }
+  size_t row(int seq, int pos, int kv_dim) const {
+    return (size_t(tables[size_t(seq) * max_pages + pos / page_size]) * page_size + pos % page_size) * kv_dim;
+  }
 };
 
 }  // namespace
@@ -429,12 +677,12 @@ int run_selftest() {
   std::mt19937 rng(42);
   Tally tally;
   DeviceMemory mem;
-  char what[128];
+  char what[160];
   const cudaStream_t s = nullptr;  // the default stream is fine for tests
 
   // matmul and gate_up_silu, for both weight formats, against ie::linear on the
   // exact values the GPU holds. Column counts 72 and 75 exercise the slow path
-  // (not a multiple of the 16-byte load width).
+  // (not a multiple of the 16-byte load width). Tensor cores engage from 32 rows.
   struct Shape { int rows, cols; };
   for (bool tc : {false, true})
   for (DType dt : {DType::BF16, DType::I8}) {
@@ -450,7 +698,7 @@ int run_selftest() {
       std::vector<float> bias = random_vec(rng, sh.rows, 1.0f);
       DeviceMatrix dW = mem.upload_matrix(m), dW2 = mem.upload_matrix(m2);
       float* dbias = mem.upload(bias);
-      for (int T : {1, 2, 3, 4, 5, 9, 17, 64, 100}) {
+      for (int T : {1, 2, 3, 4, 5, 9, 17, 32, 64, 100}) {
         std::vector<float> x = random_vec(rng, size_t(T) * sh.cols, 1.0f);
         std::vector<float> y0 = random_vec(rng, size_t(T) * sh.rows, 1.0f);
         float* dx = mem.upload(x);
@@ -494,6 +742,25 @@ int run_selftest() {
   }
   set_tensor_cores_impl(true);
 
+  // Batching must not change results: a row computed in a batch of 8 (cuda-core
+  // path) must equal the same row computed alone, bit for bit.
+  {
+    Matrix m = make_matrix(random_vec(rng, size_t(896) * 896, 0.1f), 896, 896, DType::BF16);
+    DeviceMatrix dW = mem.upload_matrix(m);
+    std::vector<float> x = random_vec(rng, size_t(8) * 896, 1.0f);
+    float* dx = mem.upload(x);
+    float* dy8 = mem.alloc<float>(size_t(8) * 896);
+    float* dy1 = mem.alloc<float>(896);
+    matmul(dy8, dx, dW, nullptr, 8, false, s);
+    bool same = true;
+    for (int t = 0; t < 8; ++t) {
+      matmul(dy1, dx + size_t(t) * 896, dW, nullptr, 1, false, s);
+      std::vector<float> a = download(dy8 + size_t(t) * 896, 896), b = download(dy1, 896);
+      same = same && std::memcmp(a.data(), b.data(), a.size() * sizeof(float)) == 0;
+    }
+    tally.add_exact("batch of 8 == 8 single rows, bit for bit", same);
+  }
+
   // rmsnorm
   {
     const int T = 3, dim = 896;
@@ -508,42 +775,134 @@ int run_selftest() {
     tally.add("rmsnorm 3x896", download(dy, x.size()), want);
   }
 
-  // rope_and_cache + attention, with tokens already in the cache (position 6)
+  const int NH = 14, NKV = 2, HD = 64, QD = NH * HD, KVD = NKV * HD;
+
+  // rope_and_cache into a paged cache: rows from two sequences at different
+  // positions, written to the right page and row of each sequence.
   {
-    const int NH = 14, NKV = 2, HD = 64, T = 3, pos0 = 6, max_tokens = 16;
-    const int QD = NH * HD, KVD = NKV * HD;
     const float theta = 1e6f;
+    TestPages pages({40, 20}, rng);  // sequence lengths after this step
+    struct Row { int seq, pos; };
+    const std::vector<Row> rows = {{0, 20}, {0, 21}, {1, 3}, {0, 39}};
+    const int T = int(rows.size());
     std::vector<float> q = random_vec(rng, size_t(T) * QD, 1.0f);
     std::vector<float> k = random_vec(rng, size_t(T) * KVD, 1.0f);
     std::vector<float> v = random_vec(rng, size_t(T) * KVD, 1.0f);
-    std::vector<float> k_cache = random_vec(rng, size_t(max_tokens) * KVD, 1.0f);
-    std::vector<float> v_cache = random_vec(rng, size_t(max_tokens) * KVD, 1.0f);
+    const size_t pool = size_t(pages.num_pages) * pages.page_size * KVD;
+    std::vector<float> k_pool = random_vec(rng, pool, 1.0f), v_pool = random_vec(rng, pool, 1.0f);
     std::vector<float> inv_freq(HD / 2);
     for (int i = 0; i < HD / 2; ++i) inv_freq[i] = 1.0f / std::pow(theta, float(2 * i) / float(HD));
 
-    // CPU reference: rotate, store into the cache, attend
-    std::vector<float> q_ref = q, k_rot = k, kc_ref = k_cache, vc_ref = v_cache;
-    ie::rope(q_ref.data(), T, NH, HD, pos0, theta);
-    ie::rope(k_rot.data(), T, NKV, HD, pos0, theta);
-    std::copy(k_rot.begin(), k_rot.end(), kc_ref.begin() + size_t(pos0) * KVD);
-    std::copy(v.begin(), v.end(), vc_ref.begin() + size_t(pos0) * KVD);
-    std::vector<float> attn_ref(size_t(T) * QD);
-    ie::attention(attn_ref.data(), q_ref.data(), kc_ref.data(), vc_ref.data(), T, pos0, NH, NKV, HD);
+    std::vector<float> q_ref = q, kp_ref = k_pool, vp_ref = v_pool;
+    std::vector<int> row_seq, row_pos;
+    for (int t = 0; t < T; ++t) {
+      ie::rope(&q_ref[size_t(t) * QD], 1, NH, HD, rows[t].pos, theta);
+      std::vector<float> kr(k.begin() + size_t(t) * KVD, k.begin() + size_t(t + 1) * KVD);
+      ie::rope(kr.data(), 1, NKV, HD, rows[t].pos, theta);
+      const size_t dst = pages.row(rows[t].seq, rows[t].pos, KVD);
+      std::copy(kr.begin(), kr.end(), kp_ref.begin() + dst);
+      std::copy(v.begin() + size_t(t) * KVD, v.begin() + size_t(t + 1) * KVD, vp_ref.begin() + dst);
+      row_seq.push_back(rows[t].seq);
+      row_pos.push_back(rows[t].pos);
+    }
 
+    KvLayout kv;
+    kv.tables = mem.upload(pages.tables);
+    kv.max_pages = pages.max_pages;
+    kv.page_size = pages.page_size;
     float* dq = mem.upload(q);
     float* dk = mem.upload(k);
     float* dv = mem.upload(v);
-    float* dkc = mem.upload(k_cache);
-    float* dvc = mem.upload(v_cache);
-    float* dinv = mem.upload(inv_freq);
-    int* dpos = mem.upload(std::vector<int>{pos0});
-    float* dout = mem.alloc<float>(attn_ref.size());
-    rope_and_cache(dq, dk, dv, dkc, dvc, dinv, T, dpos, NH, NKV, HD, s);
-    tally.add("rope (queries)", download(dq, q.size()), q_ref);
-    tally.add("rope + cache write (keys)", download(dkc, k_cache.size()), kc_ref);
-    tally.add("cache write (values)", download(dvc, v_cache.size()), vc_ref, 0.0);
-    cuda::attention(dout, dq, dkc, dvc, T, dpos, max_tokens, NH, NKV, HD, s);
-    tally.add("attention T=3 pos=6", download(dout, attn_ref.size()), attn_ref);
+    float* dkp = mem.upload(k_pool);
+    float* dvp = mem.upload(v_pool);
+    rope_and_cache(dq, dk, dv, dkp, dvp, mem.upload(inv_freq), T, mem.upload(row_pos),
+                   mem.upload(row_seq), kv, NH, NKV, HD, s);
+    tally.add("paged rope (queries)", download(dq, q.size()), q_ref);
+    tally.add("paged rope + cache write (keys)", download(dkp, pool), kp_ref);
+    tally.add("paged cache write (values)", download(dvp, pool), vp_ref, 0.0);
+  }
+
+  // Flash-decoding attention over paged caches vs the CPU on contiguous copies:
+  // single sequences, batches, mixed prefill + decode rows, chunk boundaries
+  // (256), long context, and extra empty chunks as when replaying a graph.
+  {
+    struct Row { int seq, pos; };
+    struct Case { std::vector<int> lens; std::vector<Row> rows; int capacity; const char* name; };
+    std::vector<Case> cases;
+    cases.push_back({{1}, {{0, 0}}, 1, "first token"});
+    cases.push_back({{256}, {{0, 255}}, 256, "chunk edge 255"});
+    cases.push_back({{257}, {{0, 256}}, 4096, "chunk edge 256 + empty chunks"});
+    cases.push_back({{3000}, {{0, 2999}}, 3000, "long context"});
+    {
+      Case c{{540}, {}, 540, "prefill 40 rows at 500"};
+      for (int p = 500; p < 540; ++p) c.rows.push_back({0, p});
+      cases.push_back(c);
+    }
+    cases.push_back({{6, 17, 256, 257, 3000}, {{0, 5}, {1, 16}, {2, 255}, {3, 256}, {4, 2999}}, 4096,
+                     "batch of 5 decodes"});
+    {
+      Case c{{101, 30, 1001}, {{0, 100}, {2, 1000}}, 1024, "mixed prefill + decode"};
+      for (int p = 0; p < 30; ++p) c.rows.push_back({1, p});
+      cases.push_back(c);
+    }
+    for (const Case& c : cases) {
+      TestPages pages(c.lens, rng);
+      const int T = int(c.rows.size());
+      const size_t pool = size_t(pages.num_pages) * pages.page_size * KVD;
+      std::vector<float> k_pool = random_vec(rng, pool, 1.0f), v_pool = random_vec(rng, pool, 1.0f);
+      std::vector<float> q = random_vec(rng, size_t(T) * QD, 1.0f), want(size_t(T) * QD);
+      std::vector<int> row_seq, row_pos;
+      for (int t = 0; t < T; ++t) {
+        const Row r = c.rows[t];
+        // CPU reference: this row alone over a contiguous copy of its sequence.
+        std::vector<float> kc(size_t(r.pos + 1) * KVD), vc(kc.size());
+        for (int p = 0; p <= r.pos; ++p) {
+          const size_t src = pages.row(r.seq, p, KVD);
+          std::copy(k_pool.begin() + src, k_pool.begin() + src + KVD, kc.begin() + size_t(p) * KVD);
+          std::copy(v_pool.begin() + src, v_pool.begin() + src + KVD, vc.begin() + size_t(p) * KVD);
+        }
+        ie::attention(&want[size_t(t) * QD], &q[size_t(t) * QD], kc.data(), vc.data(), 1, r.pos, NH, NKV, HD);
+        row_seq.push_back(r.seq);
+        row_pos.push_back(r.pos);
+      }
+      KvLayout kv;
+      kv.tables = mem.upload(pages.tables);
+      kv.max_pages = pages.max_pages;
+      kv.page_size = pages.page_size;
+      const int chunks = attention_chunks(c.capacity);
+      float* part_o = mem.alloc<float>(size_t(T) * NH * chunks * HD);
+      float* part_ml = mem.alloc<float>(size_t(T) * NH * chunks * 2);
+      float* dout = mem.alloc<float>(want.size());
+      cuda::attention(dout, mem.upload(q), mem.upload(k_pool), mem.upload(v_pool), T,
+                      mem.upload(row_pos), mem.upload(row_seq), kv, chunks, part_o, part_ml, NH,
+                      NKV, HD, s);
+      std::snprintf(what, sizeof(what), "paged attention: %s", c.name);
+      tally.add(what, download(dout, want.size()), want);
+    }
+  }
+
+  // gather_rows and argmax_rows
+  {
+    const int rows = 9, dim = 896;
+    std::vector<float> x = random_vec(rng, size_t(rows) * dim, 1.0f);
+    std::vector<int> pick = {8, 0, 3};
+    std::vector<float> want;
+    for (int r : pick) want.insert(want.end(), x.begin() + size_t(r) * dim, x.begin() + size_t(r + 1) * dim);
+    float* dst = mem.alloc<float>(want.size());
+    gather_rows(dst, mem.upload(x), mem.upload(pick), int(pick.size()), dim, s);
+    tally.add("gather_rows", download(dst, want.size()), want, 0.0);
+
+    const int n = 151936;  // the real vocabulary size
+    std::vector<float> logits = random_vec(rng, size_t(3) * n, 10.0f);
+    logits[size_t(0) * n + 151935] = 50.0f;                                      // max at the very end
+    logits[size_t(1) * n + 7] = 50.0f;  logits[size_t(1) * n + 90000] = 50.0f;  // tie: first one wins
+    logits[size_t(2) * n + 0] = 50.0f;                                           // max at the start
+    int32_t* dout = mem.alloc<int32_t>(3);
+    argmax_rows(dout, mem.upload(logits), 3, n, s);
+    std::vector<int32_t> got = download(dout, 3);
+    bool ok = true;
+    for (int r = 0; r < 3; ++r) ok = ok && got[r] == ie::argmax(&logits[size_t(r) * n], n);
+    tally.add_exact("argmax_rows (end, tie, start)", ok && got[1] == 7);
   }
 
   check(cudaDeviceSynchronize(), "self-test");

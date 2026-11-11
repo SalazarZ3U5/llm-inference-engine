@@ -12,14 +12,6 @@ namespace ie::cuda {
 
 namespace {
 
-// Check a CUDA API call immediately. An unchecked failure stays in CUDA's
-// "last error" slot and is reported by the next launch check instead, which
-// then blames the wrong kernel.
-void check_api(cudaError_t err, const char* what) {
-  if (err != cudaSuccess)
-    throw std::runtime_error(std::string("CUDA error in ") + what + ": " + cudaGetErrorString(err));
-}
-
 void check_launch(const char* name) {
   cudaError_t err = cudaGetLastError();
   if (err != cudaSuccess)
@@ -150,6 +142,12 @@ __device__ __forceinline__ void warp_dot(const typename W::Elem* __restrict__ wr
 
 constexpr int kWarpsPerBlock = 8;  // 256 threads = 8 output rows per block
 
+// Offset (in floats) of position `pos` of sequence `seq` in a layer's page pool.
+__device__ __forceinline__ size_t kv_offset(const KvLayout& kv, int seq, int pos, int kv_dim) {
+  const int page = kv.tables[seq * kv.max_pages + pos / kKvPageSize];
+  return (size_t(page) * kKvPageSize + pos % kKvPageSize) * kv_dim;
+}
+
 // ----------------------------------------------------------- kernels ----
 
 template <class W>
@@ -221,12 +219,13 @@ __global__ void gate_up_silu_kernel(float* __restrict__ out, const float* __rest
 }
 
 __global__ void rope_cache_kernel(float* __restrict__ q, const float* __restrict__ k,
-                                  const float* __restrict__ v, float* __restrict__ k_cache,
-                                  float* __restrict__ v_cache, const float* __restrict__ inv_freq,
-                                  const int* __restrict__ pos_ptr, int n_heads, int n_kv_heads,
-                                  int head_dim) {
-  const int t = blockIdx.x, pos = *pos_ptr + t, half = head_dim / 2;
+                                  const float* __restrict__ v, float* __restrict__ k_pool,
+                                  float* __restrict__ v_pool, const float* __restrict__ inv_freq,
+                                  const int* __restrict__ row_pos, const int* __restrict__ row_seq,
+                                  KvLayout kv, int n_heads, int n_kv_heads, int head_dim) {
+  const int t = blockIdx.x, pos = row_pos[t], half = head_dim / 2;
   const int q_dim = n_heads * head_dim, kv_dim = n_kv_heads * head_dim;
+  const size_t dst_row = kv_offset(kv, row_seq[t], pos, kv_dim);  // this token's slot in the cache
   // One thread per (head, pair): query heads first, then key heads.
   for (int j = threadIdx.x; j < (n_heads + n_kv_heads) * half; j += blockDim.x) {
     const int head = j / half, i = j % half;
@@ -240,63 +239,212 @@ __global__ void rope_cache_kernel(float* __restrict__ q, const float* __restrict
     } else {
       const int kh = head - n_heads;
       const float* src = k + size_t(t) * kv_dim + kh * head_dim;
-      float* dst = k_cache + size_t(pos) * kv_dim + kh * head_dim;  // rotated key goes straight to the cache
+      float* dst = k_pool + dst_row + kh * head_dim;  // rotated key goes straight to the cache
       const float x0 = src[i], x1 = src[i + half];
       dst[i] = x0 * c - x1 * s;
       dst[i + half] = x1 * c + x0 * s;
     }
   }
-  for (int i = threadIdx.x; i < kv_dim; i += blockDim.x)
-    v_cache[size_t(pos) * kv_dim + i] = v[size_t(t) * kv_dim + i];
+  for (int i = threadIdx.x; i < kv_dim; i += blockDim.x) v_pool[dst_row + i] = v[size_t(t) * kv_dim + i];
 }
 
-// One block per (head, query token). Scores for every visible position live in
-// shared memory, so the context is limited by shared memory size (see
-// attention_max_tokens). A tiled "flash" version without that limit comes later.
-__global__ void attention_kernel(float* __restrict__ out, const float* __restrict__ q,
-                                 const float* __restrict__ k_cache,
-                                 const float* __restrict__ v_cache, const int* __restrict__ pos_ptr,
-                                 int n_heads, int n_kv_heads, int head_dim, float scale) {
-  extern __shared__ float smem[];
-  const int h = blockIdx.x, t = blockIdx.y, p = *pos_ptr + t;
+// ------------------------------------------- flash-decoding attention ----
+//
+// The cached positions 0..p that a query can see are cut into chunks of
+// kAttnChunk. Each block handles one (head, query token, chunk) and produces a
+// *partial* softmax result over just its chunk:
+//   m = max score in the chunk
+//   l = sum over the chunk of exp(score - m)
+//   o = sum over the chunk of exp(score - m) * value      (not yet divided by l)
+// A second kernel merges the chunks exactly:
+//   M = max m_c,  L = sum l_c * exp(m_c - M),  out = sum o_c * exp(m_c - M) / L
+// So a long context is spread over many blocks instead of looping inside one,
+// and nothing needs to fit in shared memory except one chunk's scores.
+//
+// The grid always has `num_chunks` chunks per query; chunks that start past the
+// query's position exit at once. That keeps the launch identical at every
+// position, which CUDA graphs need.
+
+constexpr int kAttnChunk = 256;   // cached positions per block
+constexpr int kAttnWarps = 4;     // 128 threads
+constexpr int kMaxHeadDim = 128;  // lanes hold head_dim / 32 <= 4 values each
+constexpr int kAttnUnroll = 4;   // positions per warp per loop step (memory-level parallelism)
+constexpr int kChunkPages = kAttnChunk / kKvPageSize;  // pages one chunk spans
+static_assert(kAttnChunk % kKvPageSize == 0, "a chunk must cover whole pages");
+static_assert(kChunkPages <= kAttnWarps * 32, "one thread loads each page id");
+
+__global__ void __launch_bounds__(kAttnWarps * 32)
+attention_partial_kernel(float* __restrict__ part_o, float* __restrict__ part_ml,
+                         const float* __restrict__ q, const float* __restrict__ k_pool,
+                         const float* __restrict__ v_pool, const int* __restrict__ row_pos,
+                         const int* __restrict__ row_seq, KvLayout kv, int n_heads,
+                         int n_kv_heads, int head_dim, float scale, int num_chunks) {
+  __shared__ float scores[kAttnChunk];
+  __shared__ float partial_o[kAttnWarps][kMaxHeadDim];
+  __shared__ int chunk_pages[kChunkPages];
+  const int h = blockIdx.x, t = blockIdx.y, c = blockIdx.z;
+  const int p = row_pos[t];  // last position this query may see (causal)
+  const int seq = row_seq[t];
+  const int s0 = c * kAttnChunk;
+  const size_t slot = (size_t(t) * n_heads + h) * num_chunks + c;
+  if (s0 > p) {  // chunk lies entirely in the future: contributes nothing
+    if (threadIdx.x == 0) {
+      part_ml[2 * slot] = -INFINITY;
+      part_ml[2 * slot + 1] = 0.0f;
+    }
+    return;  // the whole block leaves together, so later barriers are safe
+  }
+  const int s1 = min(s0 + kAttnChunk, p + 1);
+  const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
   const int kvh = h / (n_heads / n_kv_heads);  // GQA
   const int q_dim = n_heads * head_dim, kv_dim = n_kv_heads * head_dim;
-  float* qs = smem;                 // [head_dim]
-  float* scores = smem + head_dim;  // [p + 1]
+  const int per_lane = head_dim / 32;
 
-  for (int d = threadIdx.x; d < head_dim; d += blockDim.x)
-    qs[d] = q[size_t(t) * q_dim + h * head_dim + d];
+  // The chunk's page ids, looked up once: the loops below then find a position's
+  // row with a shift and a shared-memory read, instead of a division and a
+  // dependent global load for every position.
+  if (threadIdx.x < (s1 - s0 + kKvPageSize - 1) / kKvPageSize)
+    chunk_pages[threadIdx.x] = kv.tables[seq * kv.max_pages + s0 / kKvPageSize + threadIdx.x];
+  __syncthreads();
+  auto row_of = [&](int s) {  // s0 is a multiple of the page size
+    const int i = s - s0;
+    return (size_t(chunk_pages[i / kKvPageSize]) * kKvPageSize + i % kKvPageSize) * kv_dim;
+  };
+
+  // Each lane keeps its slice of the query in registers: dims lane, lane+32, ...
+  float qr[kMaxHeadDim / 32];
+#pragma unroll
+  for (int j = 0; j < kMaxHeadDim / 32; ++j)
+    qr[j] = j < per_lane ? q[size_t(t) * q_dim + h * head_dim + lane + 32 * j] : 0.0f;
+
+  // 1. Scores: one warp per position, lanes across the head dimension, so the
+  //    32 lanes read one contiguous key row (coalesced), then sum by shuffles.
+  //    Each warp works on kAttnUnroll positions at a time: their loads are
+  //    independent, so all are in flight together instead of one memory
+  //    round trip per position (few warps run during decode to hide it).
+  for (int s = s0 + warp; s < s1; s += kAttnWarps * kAttnUnroll) {
+    float dot[kAttnUnroll];
+#pragma unroll
+    for (int u = 0; u < kAttnUnroll; ++u) {
+      // Past the end, re-read the last valid row (and discard the result):
+      // no branch, so the compiler issues all the loads back to back.
+      const int su = min(s + u * kAttnWarps, s1 - 1);
+      const float* kr = k_pool + row_of(su) + kvh * head_dim;
+      dot[u] = 0.0f;
+#pragma unroll
+      for (int j = 0; j < kMaxHeadDim / 32; ++j)
+        if (j < per_lane) dot[u] = fmaf(qr[j], kr[lane + 32 * j], dot[u]);
+    }
+#pragma unroll
+    for (int u = 0; u < kAttnUnroll; ++u) {
+      const float d = warp_sum(dot[u]);
+      const int su = s + u * kAttnWarps;
+      if (lane == 0 && su < s1) scores[su - s0] = d * scale;
+    }
+  }
   __syncthreads();
 
-  // 1. scores for positions 0..p (causal: nothing beyond p is ever read)
+  // 2. Softmax within the chunk (subtract the chunk max so expf can't overflow).
+  const int n = s1 - s0;
   float local_max = -INFINITY;
-  for (int s = threadIdx.x; s <= p; s += blockDim.x) {
-    const float* kr = k_cache + size_t(s) * kv_dim + kvh * head_dim;
-    float dot = 0.0f;
-    for (int d = 0; d < head_dim; ++d) dot = fmaf(qs[d], kr[d], dot);
-    dot *= scale;
-    scores[s] = dot;
-    local_max = fmaxf(local_max, dot);
-  }
-  // 2. softmax (subtract the max so expf can't overflow)
-  const float mx = block_reduce<true>(local_max);
+  for (int i = threadIdx.x; i < n; i += blockDim.x) local_max = fmaxf(local_max, scores[i]);
+  const float m = block_reduce<true>(local_max);
   float local_sum = 0.0f;
-  for (int s = threadIdx.x; s <= p; s += blockDim.x) {
-    const float e = expf(scores[s] - mx);
-    scores[s] = e;
+  for (int i = threadIdx.x; i < n; i += blockDim.x) {
+    const float e = expf(scores[i] - m);
+    scores[i] = e;
     local_sum += e;
   }
-  const float inv_sum = 1.0f / block_reduce<false>(local_sum);  // its barriers publish `scores`
+  const float l = block_reduce<false>(local_sum);  // its barriers also publish `scores`
 
-  // 3. weighted sum of values; thread d owns output dimension d
+  // 3. Weighted values: again one warp per position, lanes across dimensions.
+  //    Same unrolling; positions are still added in increasing order, so the
+  //    result is bit-identical to one position at a time.
+  float acc[kMaxHeadDim / 32] = {};
+  for (int s = s0 + warp; s < s1; s += kAttnWarps * kAttnUnroll) {
+#pragma unroll
+    for (int u = 0; u < kAttnUnroll; ++u) {
+      // Past the end: weight 0 on the last valid row, and fmaf(0, v, acc) == acc.
+      const int su = s + u * kAttnWarps, sc = min(su, s1 - 1);
+      const float w = su < s1 ? scores[sc - s0] : 0.0f;
+      const float* vr = v_pool + row_of(sc) + kvh * head_dim;
+#pragma unroll
+      for (int j = 0; j < kMaxHeadDim / 32; ++j)
+        if (j < per_lane) acc[j] = fmaf(w, vr[lane + 32 * j], acc[j]);
+    }
+  }
+#pragma unroll
+  for (int j = 0; j < kMaxHeadDim / 32; ++j)
+    if (j < per_lane) partial_o[warp][lane + 32 * j] = acc[j];
+  __syncthreads();
+
+  // Add the 4 warps' partial outputs and store this chunk's result.
   for (int d = threadIdx.x; d < head_dim; d += blockDim.x) {
-    const float* vc = v_cache + kvh * head_dim + d;
-    float acc = 0.0f;
-    for (int s = 0; s <= p; ++s) acc = fmaf(scores[s], vc[size_t(s) * kv_dim], acc);
-    out[size_t(t) * q_dim + h * head_dim + d] = acc * inv_sum;
+    float o = 0.0f;
+#pragma unroll
+    for (int w = 0; w < kAttnWarps; ++w) o += partial_o[w][d];
+    part_o[slot * head_dim + d] = o;
+  }
+  if (threadIdx.x == 0) {
+    part_ml[2 * slot] = m;
+    part_ml[2 * slot + 1] = l;
   }
 }
 
+// One block per (head, query token), one thread per output dimension.
+__global__ void attention_merge_kernel(float* __restrict__ out, const float* __restrict__ part_o,
+                                       const float* __restrict__ part_ml, int n_heads,
+                                       int head_dim, int num_chunks) {
+  const int h = blockIdx.x, t = blockIdx.y, d = threadIdx.x;
+  const size_t base = (size_t(t) * n_heads + h) * num_chunks;
+  float M = -INFINITY;
+  for (int c = 0; c < num_chunks; ++c) M = fmaxf(M, part_ml[2 * (base + c)]);
+  float L = 0.0f, acc = 0.0f;
+  for (int c = 0; c < num_chunks; ++c) {
+    const float l = part_ml[2 * (base + c) + 1];
+    if (l == 0.0f) continue;  // empty (future) chunk
+    const float w = expf(part_ml[2 * (base + c)] - M);
+    L += l * w;
+    acc += part_o[(base + c) * head_dim + d] * w;
+  }
+  out[size_t(t) * n_heads * head_dim + h * head_dim + d] = acc / L;
+}
+
+__global__ void gather_rows_kernel(float* __restrict__ dst, const float* __restrict__ src,
+                                   const int* __restrict__ rows, int dim) {
+  const float* in = src + size_t(rows[blockIdx.x]) * dim;
+  float* out = dst + size_t(blockIdx.x) * dim;
+  for (int i = threadIdx.x; i < dim; i += blockDim.x) out[i] = in[i];
+}
+
+// One block per row: each thread scans a strided slice, then the block keeps the
+// largest value (lowest index on ties, matching the CPU's argmax).
+__global__ void argmax_rows_kernel(int32_t* __restrict__ out, const float* __restrict__ x, int n) {
+  __shared__ float best_v[1024];
+  __shared__ int best_i[1024];
+  const float* row = x + size_t(blockIdx.x) * n;
+  float bv = -INFINITY;
+  int bi = 0x7fffffff;
+  for (int i = threadIdx.x; i < n; i += blockDim.x) {
+    const float v = row[i];
+    if (v > bv) { bv = v; bi = i; }  // i only increases, so the first max is kept
+  }
+  best_v[threadIdx.x] = bv;
+  best_i[threadIdx.x] = bi;
+  __syncthreads();
+  for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+    if (threadIdx.x < stride) {
+      const float ov = best_v[threadIdx.x + stride];
+      const int oi = best_i[threadIdx.x + stride];
+      if (ov > best_v[threadIdx.x] || (ov == best_v[threadIdx.x] && oi < best_i[threadIdx.x])) {
+        best_v[threadIdx.x] = ov;
+        best_i[threadIdx.x] = oi;
+      }
+    }
+    __syncthreads();
+  }
+  if (threadIdx.x == 0) out[blockIdx.x] = best_i[0];
+}
 
 // ------------------------------------------------- tensor-core GEMM ----
 //
@@ -454,8 +602,15 @@ tc_gemm_kernel(float* __restrict__ y, const float* __restrict__ x,
 
 bool g_tensor_cores = true;
 
-// Tensor cores for any multi-token call whose width splits into 32-column tiles.
-bool use_tensor_cores(int T, int cols) { return g_tensor_cores && T >= 2 && cols % kTileK == 0; }
+// Tensor cores for prefill-sized calls. Below 32 rows (decode, small batches) the
+// 64-row tiles would be mostly empty and a 896-row matrix would make only 14
+// blocks, too few to keep 24 SMs busy; the warp-per-row kernel is faster there,
+// and it computes each row exactly as it would alone, so batching doesn't change
+// any sequence's output.
+constexpr int kTcMinTokens = 32;
+bool use_tensor_cores(int T, int cols) {
+  return g_tensor_cores && T >= kTcMinTokens && cols % kTileK == 0;
+}
 
 template <class W, bool kGateUp>
 void launch_tc(float* y, const float* x, const DeviceMatrix& A, const DeviceMatrix* B,
@@ -465,28 +620,6 @@ void launch_tc(float* y, const float* x, const DeviceMatrix& A, const DeviceMatr
   tc_gemm_kernel<W, kGateUp><<<grid, kTcThreads, 0, stream>>>(
       y, x, static_cast<const E*>(A.data), A.scale, B ? static_cast<const E*>(B->data) : nullptr,
       B ? B->scale : nullptr, bias, T, A.rows, A.cols, accumulate);
-}
-
-// Largest dynamic shared memory the attention kernel may request per block.
-int max_attention_smem_bytes() {
-  static const int bytes = [] {
-    int dev = 0, optin = 0;
-    check_api(cudaGetDevice(&dev), "cudaGetDevice");
-    check_api(cudaDeviceGetAttribute(&optin, cudaDevAttrMaxSharedMemoryPerBlockOptin, dev),
-              "cudaDeviceGetAttribute");
-    // The per-block limit (99 KB on Ada) covers the kernel's *static* shared
-    // memory too (block_reduce's arrays, 256 bytes), so only the rest can be
-    // requested dynamically at launch.
-    cudaFuncAttributes attr{};
-    check_api(cudaFuncGetAttributes(&attr, attention_kernel), "cudaFuncGetAttributes");
-    const int dynamic_max = optin - int(attr.sharedSizeBytes);
-    // Raise the kernel's limit above the default 48 KB.
-    check_api(cudaFuncSetAttribute(attention_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                   dynamic_max),
-              "cudaFuncSetAttribute");
-    return dynamic_max;
-  }();
-  return bytes;
 }
 
 int blocks_for(int rows) { return (rows + kWarpsPerBlock - 1) / kWarpsPerBlock; }
@@ -561,30 +694,43 @@ void gate_up_silu(float* out, const float* x, const DeviceMatrix& Wg, const Devi
   check_launch("gate_up_silu");
 }
 
-void rope_and_cache(float* q, const float* k, const float* v, float* k_cache, float* v_cache,
-                    const float* inv_freq, int T, const int* pos, int n_heads, int n_kv_heads,
-                    int head_dim, cudaStream_t stream) {
+void rope_and_cache(float* q, const float* k, const float* v, float* k_pool, float* v_pool,
+                    const float* inv_freq, int T, const int* row_pos, const int* row_seq,
+                    KvLayout kv, int n_heads, int n_kv_heads, int head_dim, cudaStream_t stream) {
+  if (kv.page_size != kKvPageSize) throw std::runtime_error("rope_and_cache: KV page size must be 16");
   const int threads = std::min(1024, std::max(32, (n_heads + n_kv_heads) * head_dim / 2));
-  rope_cache_kernel<<<T, threads, 0, stream>>>(q, k, v, k_cache, v_cache, inv_freq, pos, n_heads,
-                                               n_kv_heads, head_dim);
+  rope_cache_kernel<<<T, threads, 0, stream>>>(q, k, v, k_pool, v_pool, inv_freq, row_pos, row_seq,
+                                               kv, n_heads, n_kv_heads, head_dim);
   check_launch("rope_and_cache");
 }
 
-int attention_max_tokens() {
-  return max_attention_smem_bytes() / int(sizeof(float)) - 256;  // leave room for q (head_dim <= 256)
+int attention_chunks(int context_tokens) { return (context_tokens + kAttnChunk - 1) / kAttnChunk; }
+
+void attention(float* out, const float* q, const float* k_pool, const float* v_pool, int T,
+               const int* row_pos, const int* row_seq, KvLayout kv, int num_chunks,
+               float* part_o, float* part_ml, int n_heads, int n_kv_heads, int head_dim,
+               cudaStream_t stream) {
+  if (head_dim % 32 != 0 || head_dim > kMaxHeadDim)
+    throw std::runtime_error("attention: head_dim must be a multiple of 32, at most 128");
+  if (kv.page_size != kKvPageSize) throw std::runtime_error("attention: KV page size must be 16");
+  const dim3 grid(n_heads, T, num_chunks);
+  attention_partial_kernel<<<grid, kAttnWarps * 32, 0, stream>>>(
+      part_o, part_ml, q, k_pool, v_pool, row_pos, row_seq, kv, n_heads, n_kv_heads, head_dim,
+      1.0f / sqrtf(float(head_dim)), num_chunks);
+  check_launch("attention_partial");
+  attention_merge_kernel<<<dim3(n_heads, T), head_dim, 0, stream>>>(out, part_o, part_ml, n_heads,
+                                                                    head_dim, num_chunks);
+  check_launch("attention_merge");
 }
 
-void attention(float* out, const float* q, const float* k_cache, const float* v_cache, int T,
-               const int* pos, int max_tokens, int n_heads, int n_kv_heads, int head_dim,
-               cudaStream_t stream) {
-  // Sized for the whole cache, so the same launch works at every position.
-  const size_t smem = sizeof(float) * (size_t(head_dim) + max_tokens);
-  if (smem > size_t(max_attention_smem_bytes()))
-    throw std::runtime_error("attention: context too long for the shared-memory kernel");
-  const dim3 grid(n_heads, T);
-  attention_kernel<<<grid, 128, smem, stream>>>(out, q, k_cache, v_cache, pos, n_heads, n_kv_heads,
-                                                head_dim, 1.0f / sqrtf(float(head_dim)));
-  check_launch("attention");
+void gather_rows(float* dst, const float* src, const int* rows, int R, int dim, cudaStream_t stream) {
+  gather_rows_kernel<<<R, 256, 0, stream>>>(dst, src, rows, dim);
+  check_launch("gather_rows");
+}
+
+void argmax_rows(int32_t* out, const float* x, int R, int n, cudaStream_t stream) {
+  argmax_rows_kernel<<<R, 1024, 0, stream>>>(out, x, n);
+  check_launch("argmax_rows");
 }
 
 }  // namespace ie::cuda
