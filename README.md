@@ -5,7 +5,7 @@ It loads Hugging Face `safetensors` weights and generates text on an NVIDIA GPU.
 
 Target model: **Qwen2.5-0.5B-Instruct** (download needs no license approval). Development GPU: RTX 4060 (sm_89, 8 GB).
 
-> Status: **Phase 4 (serving) in progress.** The whole forward pass runs on an RTX 4060 with
+> Status: **Phase 5 (presentation) in progress.** The whole forward pass runs on an RTX 4060 with
 > hand-written CUDA kernels and CUDA graphs: **213.8 tok/s decode with BF16** (211 GB/s, 97% of the
 > measured memory bandwidth) and **361.6 tok/s with INT8**, 127x the first working version, while still
 > matching Hugging Face at every layer. Prefill uses tensor cores and FlashAttention-style tiled
@@ -13,7 +13,7 @@ Target model: **Qwen2.5-0.5B-Instruct** (download needs no license approval). De
 > flash-decoding keeps decode fast at long context (**~180 tok/s after a 4,000-token prompt**). A paged
 > KV cache and continuous batching serve many requests at once: **2,346 tok/s across 64 concurrent
 > requests** (2,485 with a 16-bit KV cache), 12.2x serving them one at a time, with every request's
-> output identical to serving it alone.
+> output identical to serving it alone. `ie serve` exposes it as an OpenAI-compatible HTTP server.
 
 ## Layout
 
@@ -36,6 +36,8 @@ src/
   threadpool.{h,cpp}    fixed thread pool for parallel loops (spins briefly, then sleeps)
   runner.{h,cpp}        Runner interface (weights + KV cache on one device); CPU implementation;
                         BatchRunner interface (many sequences, paged KV cache)
+  server.{h,cpp}        OpenAI-compatible HTTP server: request parsing, the engine thread running
+                        continuous batching, SSE streaming (no CUDA code: needs only a BatchRunner)
   cuda/
     cuda_check.cuh      CUDA_CHECK error macro
     device_check.cu     GPU info, vector-add test, memory-bandwidth test
@@ -48,6 +50,7 @@ scripts/
   download_model.py     fetch weights + tokenizer into models/
   profile.bat           Nsight Systems profiles of decode, long-context decode and serving
   profile_summary.py    per-kernel GPU time from a profile, split by phase (prefill / decode / batch)
+  test_server.py        smoke test for a running `ie serve` (stdlib only): plain, streamed, concurrent
   reference.py          dump ground-truth activations from HF transformers into reference/
   make_tokenizer_cases.py   expected token ids from HF's tokenizer -> tests/tokenizer_cases.json
   gen_unicode_tables.py     regenerate src/unicode_tables.h
@@ -140,6 +143,34 @@ every request gets exactly the tokens it gets when served alone.
 Every command that runs the model takes `--device cpu|cuda`. The default is the GPU when the build has
 CUDA and one is present.
 
+### 7. Run the server
+
+```
+build\release\ie.exe serve models\qwen2.5-0.5b-instruct --port 8080
+python scripts\test_server.py --url http://127.0.0.1:8080
+```
+
+An OpenAI-compatible HTTP server on the GPU: `POST /v1/chat/completions` and `POST /v1/completions`
+(add `"stream": true` for Server-Sent Events), `GET /v1/models` and `GET /health`. Requests arriving
+at the same time are batched by the same scheduler as `serve-bench`. Any OpenAI client works:
+
+```python
+from openai import OpenAI
+client = OpenAI(base_url="http://127.0.0.1:8080/v1", api_key="unused")
+reply = client.chat.completions.create(model="qwen2.5-0.5b-instruct",
+                                       messages=[{"role": "user", "content": "Hi!"}])
+print(reply.choices[0].message.content)
+```
+
+Options: `--host` (default `127.0.0.1`), `--port`, `--max-batch N` (requests decoded together, default
+32), `--ctx N` (prompt + reply per request), `--kv-gb G`, `--kv f16` (16-bit KV cache: twice the
+tokens per GB), `--weights`; the sampling options set the
+defaults for requests that leave them out. Besides the standard fields, requests accept `top_k` and
+`repetition_penalty`. `scripts\test_server.py` checks a plain and a streamed reply, a burst of
+concurrent requests, and that a greedy reply is the same alone and under load. On the RTX 4060 with
+the model's default sampling (temperature 0.7, top-p 0.8, top-k 20): the first streamed text arrives
+11 ms after the request, and 16 simultaneous requests are decoded together at 1,039 tok/s in total.
+
 ## Roadmap
 
 ### Phase 0: correct forward pass (CPU, FP32) ✅
@@ -205,7 +236,9 @@ CUDA and one is present.
 - [ ] Speculative decoding
 
 ### Phase 5: present it
-- [ ] OpenAI-compatible HTTP server with streaming
+- [x] OpenAI-compatible HTTP server with streaming (`ie serve`): chat and text completions, SSE
+      streaming, stop strings; one engine thread runs continuous batching for every connection, and a
+      client that disconnects frees its KV pages at once
 - [ ] Benchmarks vs llama.cpp / PyTorch on the same GPU, with charts in this README
 
 ## Performance log
@@ -236,6 +269,7 @@ CUDA and one is present.
 | 2026-11-11 | **GPU: same, serving 64 concurrent requests** | **2346.3** | - | 12.2x one at a time; 64-sequence step 16.4 → 12.9 ms |
 | 2026-11-11 | GPU: FP16 KV cache (`--kv f16`), serving 64 concurrent requests | **2485.0** | - | +6%; cache 1,152 → 576 MiB; perplexity +0.0001 |
 | 2026-11-11 | GPU: FP16 KV cache, 4,000-token prompt | 173.9 | 9755.4 | within run-to-run noise of FP32 for one sequence |
+| 2026-11-11 | **`ie serve` (HTTP, sampling), 16 simultaneous requests** | **1039.2** | - | first streamed text after 11 ms; greedy reply identical alone and under load |
 
 Full sweep (`ie bench --sweep`, 64-token prompt, 32 generated tokens) on a Ryzen 5 3600XT
 (6 cores / 12 threads, AVX2, dual-channel DDR4) and an RTX 4060 (8 GB):

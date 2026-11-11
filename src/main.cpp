@@ -8,6 +8,7 @@
 //   ie inspect  <model.safetensors>                list every tensor in a weights file
 //   ie bench    <model_dir> [--sweep]              measure prefill and decode speed
 //   ie serve-bench <model_dir> [--check]           many requests at once: continuous batching (GPU)
+//   ie serve    <model_dir> [--port 8080]          OpenAI-compatible HTTP server (GPU)
 //   ie perplexity <model_dir> <text_file>          measure model quality on a text
 //   ie test-kernels                                check the fast matmul kernels against the reference
 //   ie test-cuda                                   check every CUDA kernel against the CPU version
@@ -22,6 +23,9 @@
 //   (defaults come from the model's generation_config.json)
 // Serving options:  --requests N (default 64)  --concurrency 1,4,16,... (batch sizes to try)
 //                   --kv-gb G (KV cache budget, default 2)  --check (compare with one at a time)
+// Server options:   --host H (default 127.0.0.1)  --port N (default 8080)
+//                   --max-batch N (requests at once, default 32); --ctx, --kv-gb and the
+//                   sampling options set the defaults for requests that don't say
 // Other options:    --max-tokens N (default 256)  --ctx N (KV cache size, default 4096)
 //                   --system "<text>" (chat)  --chat (generate)
 
@@ -50,6 +54,7 @@
 #include "safetensors.h"
 #include "ops.h"
 #include "sampler.h"
+#include "server.h"
 #include "threadpool.h"
 #include "tokenizer.h"
 #include "weights.h"
@@ -87,6 +92,8 @@ void usage() {
       "  ie inspect  <model.safetensors>\n"
       "  ie bench    <model_dir> [--sweep] [--prompt-tokens N] [--gen-tokens N]\n"
       "  ie serve-bench <model_dir> [--requests N] [--concurrency 1,4,16,32,64] [--kv-gb G] [--check]\n"
+      "  ie serve    <model_dir> [--host 127.0.0.1] [--port 8080] [--max-batch 32] [--ctx N] [--kv-gb G]\n"
+      "              [--kv f32|f16]\n"
       "  ie perplexity <model_dir> <text_file>\n"
       "  ie test-kernels\n"
       "  ie test-cuda\n"
@@ -181,6 +188,10 @@ struct Options {
   std::string concurrency = "1,4,16,32,64";
   double kv_gb = 2.0;
   bool check = false;
+  // HTTP server
+  std::string host = "127.0.0.1";
+  int port = 8080;
+  int max_batch = 32;
 };
 
 Options parse_options(const std::vector<std::string>& args, size_t first) {
@@ -219,6 +230,9 @@ Options parse_options(const std::vector<std::string>& args, size_t first) {
     else if (a == "--concurrency") o.concurrency = next();
     else if (a == "--kv-gb") o.kv_gb = std::stod(next());
     else if (a == "--check") o.check = true;
+    else if (a == "--host") o.host = next();
+    else if (a == "--port") o.port = std::stoi(next());
+    else if (a == "--max-batch") o.max_batch = std::stoi(next());
     else if (a.rfind("--", 0) == 0) throw std::runtime_error("unknown option " + a);
     else o.positional.push_back(a);
   }
@@ -855,6 +869,52 @@ int cmd_serve_bench(const Options& o) {
 #endif
 }
 
+// -------------------------------------------------------------- serve ----
+
+// The OpenAI-compatible HTTP server (src/server.cpp) on the batched GPU engine.
+int cmd_serve(const Options& o) {
+  if (o.positional.empty()) { usage(); return 1; }
+#ifndef IE_WITH_CUDA
+  std::printf("serve needs the CUDA backend (this build has none).\n");
+  return 1;
+#else
+  if (resolve_device(o.device == "auto" ? "cuda" : o.device) != "cuda")
+    throw std::runtime_error("serve runs on the GPU only (--device cuda)");
+  if (o.max_batch < 1) throw std::runtime_error("--max-batch must be >= 1");
+  if (o.port < 0 || o.port > 65535) throw std::runtime_error("--port must be 0-65535");
+  apply_compute_options(o);
+  const fs::path model_dir = o.positional[0];
+  ie::Tokenizer tok(model_dir.string());
+
+  ie::ServerOptions so;
+  so.host = o.host;
+  so.port = o.port;
+  // The model's id in the API: its folder name ("qwen2.5-0.5b-instruct").
+  fs::path name = model_dir.lexically_normal();
+  if (name.filename().empty()) name = name.parent_path();
+  so.model_id = name.filename().string();
+  so.default_system = o.system;
+  so.sampling = sampling_for(o, model_dir.string());
+  so.default_max_tokens = o.max_tokens;
+
+  const auto t0 = Clock::now();
+  const ie::DType dtype = ie::parse_dtype(o.weights);
+  if (dtype == ie::DType::F32) throw std::runtime_error("the CUDA backend runs bf16 or int8 weights");
+  ie::Config cfg = ie::load_config((model_dir / "config.json").string());
+  std::unique_ptr<ie::BatchRunner> eng;
+  {
+    ie::SafeTensorsFile st((model_dir / "model.safetensors").string());
+    ie::Weights w = ie::load_weights(st, cfg, dtype);
+    eng = ie::cuda::make_batch_runner(cfg, w, o.max_batch, o.ctx, size_t(o.kv_gb * 1073741824.0),
+                                      o.graphs, o.kv_f16);
+  }
+  std::fprintf(stderr, "[loaded as %s in %.1f s | %s | KV cache %.0f MiB]\n", ie::dtype_name(dtype),
+               seconds_since(t0), eng->device_name().c_str(), eng->kv_cache_bytes() / 1048576.0);
+  ie::run_server(*eng, tok, so);
+  return 0;
+#endif
+}
+
 // --------------------------------------------------------- perplexity ----
 
 // Perplexity = exp(average negative log-likelihood of each next token).
@@ -1141,6 +1201,7 @@ int main(int argc, char** argv) {
     if (cmd == "inspect") return cmd_inspect(o);
     if (cmd == "bench") return cmd_bench(o);
     if (cmd == "serve-bench") return cmd_serve_bench(o);
+    if (cmd == "serve") return cmd_serve(o);
     if (cmd == "perplexity") return cmd_perplexity(o);
     if (cmd == "test-kernels") return cmd_test_kernels(o);
     if (cmd == "test-cuda") return cmd_test_cuda(o);

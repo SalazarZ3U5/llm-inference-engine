@@ -26,8 +26,8 @@ if(IE_ENABLE_CUDA)
 endif()
 
 # --- dependencies -----------------------------------------------------------
-# nlohmann/json v3.11.3 (MIT), vendored as a single header: only used to parse
-# safetensors headers and config.json.
+# nlohmann/json v3.11.3 (MIT), vendored as a single header: parses safetensors
+# headers, config.json and the server's requests.
 add_library(nlohmann_json INTERFACE)
 target_include_directories(nlohmann_json SYSTEM INTERFACE third_party)
 add_library(nlohmann_json::nlohmann_json ALIAS nlohmann_json)
@@ -75,6 +75,17 @@ else()
   target_compile_options(ie_core PUBLIC $<$<COMPILE_LANGUAGE:CXX>:-Wall -Wextra>)
 endif()
 
+# --- HTTP server --------------------------------------------------------------
+# cpp-httplib v0.66.0 (MIT), vendored as a single header, built without TLS.
+# Only server.cpp includes it (on Windows its winsock2.h must precede windows.h).
+add_library(httplib INTERFACE)
+target_include_directories(httplib SYSTEM INTERFACE third_party)
+target_link_libraries(httplib INTERFACE Threads::Threads $<$<PLATFORM_ID:Windows>:ws2_32>)
+
+# No CUDA code: the server only needs a BatchRunner, so it builds in every configuration.
+add_library(ie_server src/server.cpp)
+target_link_libraries(ie_server PUBLIC ie_core PRIVATE httplib)
+
 # --- CLI --------------------------------------------------------------------
 add_executable(ie src/main.cpp)
-target_link_libraries(ie PRIVATE ie_core)
+target_link_libraries(ie PRIVATE ie_core ie_server)
