@@ -601,6 +601,7 @@ std::string device_description() {
 
 void set_tensor_cores(bool on) { ie::cuda::set_tensor_cores_impl(on); }
 void set_tc_fp16(bool on) { ie::cuda::set_tc_fp16_impl(on); }
+void set_cublas(bool on) { ie::cuda::set_cublas_impl(on); }
 
 std::unique_ptr<Runner> make_runner(const Config& cfg, const Weights& w, int max_tokens,
                                     bool use_graphs, bool kv_f16) {
@@ -726,15 +727,21 @@ int run_selftest() {
   // small shapes there split K across blocks, and 3200 x 96 has enough output
   // tiles (50 at 64 rows) to run unsplit.
   struct Shape { int rows, cols; };
-  for (int mode : {0, 1, 2})  // CUDA cores; tensor cores, exact BF16 split; tensor cores, one FP16 pass
+  // Modes: 0 CUDA cores; 1 tensor cores, exact BF16 split; 2 tensor cores, one
+  // FP16 pass; 3 and 4: the same two through cuBLAS (BF16 weights; INT8 weights
+  // stay on this engine's kernel there).
+  for (int mode : {0, 1, 2, 3, 4})
   for (DType dt : {DType::BF16, DType::I8}) {
     set_tensor_cores_impl(mode > 0);
-    set_tc_fp16_impl(mode == 2);
+    set_tc_fp16_impl(mode == 2 || mode == 4);
+    set_cublas_impl(mode >= 3);
     const char* dn = dtype_name(dt);
-    const char* path = mode == 0 ? "cuda-core" : mode == 1 ? "tc" : "tc-fp16";
-    // Split-BF16 tensor-core results are within ~1e-5 of FP32; one FP16 pass
-    // rounds every activation to 11 significant bits (~2.4e-4 relative).
-    const double tol = mode == 0 ? 2e-5 : mode == 1 ? 1e-4 : 2e-3;
+    const char* paths[] = {"cuda-core", "tc", "tc-fp16", "cublas", "cublas-1pass"};
+    const char* path = paths[mode];
+    // Split-BF16 results are within ~1e-5 of FP32; one FP16 pass rounds every
+    // activation to 11 significant bits (~2.4e-4 relative), one BF16 pass
+    // (cuBLAS) to 8 (~2e-3).
+    const double tol = mode == 0 ? 2e-5 : (mode == 1 || mode == 3) ? 1e-4 : mode == 2 ? 2e-3 : 1e-2;
     for (Shape sh : {Shape{37, 72}, Shape{37, 75}, Shape{128, 896}, Shape{300, 896}, Shape{64, 4864}, Shape{3200, 96}}) {
       Matrix m = make_matrix(random_vec(rng, size_t(sh.rows) * sh.cols, 0.1f), sh.rows, sh.cols, dt);
       Matrix m2 = make_matrix(random_vec(rng, size_t(sh.rows) * sh.cols, 0.1f), sh.rows, sh.cols, dt);
@@ -786,6 +793,7 @@ int run_selftest() {
   }
   set_tensor_cores_impl(true);
   set_tc_fp16_impl(false);
+  set_cublas_impl(false);
 
   // Batching must not change results: on the CUDA-core path (batches under 32),
   // a token computed in a batch must equal the same token computed alone, bit

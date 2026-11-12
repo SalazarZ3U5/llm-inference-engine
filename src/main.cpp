@@ -16,7 +16,8 @@
 //
 // Performance options: --device cpu|cuda (default: cuda if available)
 //                      --no-graph, --no-tensor-cores (CUDA, for comparisons)
-//                      --tc-fp16 (CUDA: tensor-core matmuls in one FP16 pass, ~2x faster prefill)
+//                      --tc-fp16 (CUDA: tensor-core matmuls in one FP16 pass instead of two BF16)
+//                      --cublas (CUDA: prefill matmuls by cuBLAS, to compare with this engine's kernel)
 //                      --kv f32|f16 (CUDA KV cache precision, default f32)
 //                      --weights f32|bf16|int8 (default bf16)  --threads N (default: physical cores)
 //                      --kernel scalar|avx2 (default: avx2 if compiled in)
@@ -104,7 +105,7 @@ void usage() {
       "\n"
       "options: --max-tokens N  --ctx N  --temp T  --top-k K  --top-p P  --rep R  --seed S  --greedy\n"
       "         --device cpu|cuda  --weights f32|bf16|int8  --threads N  --kernel scalar|avx2\n"
-      "         --no-graph  --no-tensor-cores  --tc-fp16  --kv f32|f16\n");
+      "         --no-graph  --no-tensor-cores  --tc-fp16  --cublas  --kv f32|f16\n");
 }
 
 double seconds_since(Clock::time_point t0) {
@@ -181,6 +182,7 @@ struct Options {
   bool graphs = true;            // CUDA: replay each decode step as a recorded graph
   bool tensor_cores = true;      // CUDA: tensor-core GEMM for multi-token (prefill) matmuls
   bool tc_fp16 = false;          // CUDA: those matmuls in one FP16 pass instead of the exact BF16 split
+  bool cublas = false;           // CUDA: prefill matmuls by cuBLAS (comparison)
   bool kv_f16 = false;           // CUDA: KV cache as FP16 (half the memory) instead of FP32
   std::string weights = "bf16";
   int threads = 0;           // 0 = one per physical core
@@ -222,6 +224,7 @@ Options parse_options(const std::vector<std::string>& args, size_t first) {
     else if (a == "--no-graph") o.graphs = false;
     else if (a == "--no-tensor-cores") o.tensor_cores = false;
     else if (a == "--tc-fp16") o.tc_fp16 = true;
+    else if (a == "--cublas") o.cublas = true;
     else if (a == "--kv") {
       const std::string v = next();
       if (v != "f32" && v != "f16") throw std::runtime_error("--kv must be f32 or f16");
@@ -280,6 +283,7 @@ void apply_compute_options(const Options& o) {
   set_tensor_cores(o.tensor_cores);
 #ifdef IE_WITH_CUDA
   ie::cuda::set_tc_fp16(o.tc_fp16);
+  ie::cuda::set_cublas(o.cublas);
 #endif
 }
 
@@ -569,6 +573,9 @@ BenchResult run_bench(ie::Runner& model, const ie::Tokenizer& tok, int prompt_to
 
 int cmd_bench(const Options& o) {
   if (o.positional.empty()) { usage(); return 1; }
+  // GPU options (--tc-fp16, --cublas, ...); each configuration below then sets
+  // its own threads, CPU kernel and tensor-core switch.
+  apply_compute_options(o);
   const fs::path model_dir = o.positional[0];
   ie::Tokenizer tok(model_dir.string());
 
@@ -628,7 +635,7 @@ int cmd_bench(const Options& o) {
     BenchResult r = run_bench(*model, tok, o.prompt_tokens, o.gen_tokens);
     const bool gpu = c.device == "cuda";
     std::printf("| %s | %s | %s | %s | %.1f | %.1f | %.1f |\n", c.device.c_str(), c.weights.c_str(),
-                gpu ? (std::string("cuda") + (c.graphs ? " graph" : "") + (c.tensor_cores ? (o.tc_fp16 ? " + tc fp16" : " + tc") : "")).c_str()
+                gpu ? (std::string("cuda") + (c.graphs ? " graph" : "") + (c.tensor_cores ? std::string(o.cublas ? " + cublas" : " + tc") + (o.tc_fp16 ? " 1-pass" : "") : std::string())).c_str()
                     : ie::kernel_name(c.kernel),
                 gpu ? "-" : std::to_string(c.threads).c_str(), r.prefill_tps, r.decode_tps, r.gbps);
     std::fflush(stdout);

@@ -61,7 +61,8 @@ endif()
 if(IE_ENABLE_CUDA)
   target_sources(ie_core PRIVATE src/cuda/device_check.cu src/cuda/kernels.cu src/cuda/cuda_runner.cu)
   target_compile_definitions(ie_core PUBLIC IE_WITH_CUDA=1)
-  target_link_libraries(ie_core PUBLIC CUDA::cudart)
+  # cuBLAS: only for the --cublas comparison; the engine's own kernels need just the runtime.
+  target_link_libraries(ie_core PUBLIC CUDA::cudart CUDA::cublas)
   # Line info lets Nsight Compute map hot spots back to your .cu source lines.
   target_compile_options(ie_core PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-lineinfo>)
 endif()

@@ -117,6 +117,10 @@ void set_tensor_cores_impl(bool on);
 // work, ~3 significant digits on the activations, as most engines do.
 void set_tc_fp16_impl(bool on);
 bool tc_fp16();
+
+// For comparison: tensor-core matmuls with BF16 weights done by cuBLAS instead
+// of this engine's kernel, for work not recorded into a CUDA graph (prefill).
+void set_cublas_impl(bool on);
 bool tensor_cores();
 
 }  // namespace ie::cuda

@@ -1,5 +1,6 @@
 #include "cuda/kernels.cuh"
 
+#include <cublas_v2.h>
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <mma.h>
@@ -970,6 +971,111 @@ void launch_tc(float* y, const float* x, const DeviceMatrix& A, const DeviceMatr
   }
 }
 
+// ------------------------------------------------------ cuBLAS (optional) ----
+//
+// For comparison (--cublas): the tensor-core matmuls done by NVIDIA's cuBLAS
+// instead of tc_gemm_kernel, in the same precision mode (x split into BF16
+// hi + lo and two GEMMs by default; one BF16 GEMM with --tc-fp16, BF16 rather
+// than FP16 because cuBLAS needs x in the weights' type). Only BF16 weights
+// (cuBLAS's 8-bit GEMM also wants 8-bit activations), and only work that is not
+// being recorded into a CUDA graph, i.e. prefill; batched decode keeps this
+// engine's kernels, so the comparison isolates the prefill matmul.
+
+bool g_cublas = false;
+cublasHandle_t g_cublas_handle = nullptr;
+__nv_bfloat16 *g_x_hi = nullptr, *g_x_lo = nullptr;  // x as BF16 parts, [T, K]
+float *g_gate = nullptr, *g_up = nullptr;             // gate_up's two products, [T, N]
+size_t g_x_hi_cap = 0, g_x_lo_cap = 0, g_gate_cap = 0, g_up_cap = 0;
+
+void cublas_check(cublasStatus_t st, const char* what) {
+  if (st != CUBLAS_STATUS_SUCCESS)
+    throw std::runtime_error(std::string("cuBLAS error in ") + what + ": status " + std::to_string(int(st)));
+}
+
+// Grows a scratch buffer (prefill only: never while a graph is being recorded).
+// cudaFree waits for the GPU, so no queued kernel still uses the old buffer.
+template <class T>
+T* grow(T*& p, size_t& cap, size_t n) {
+  if (n > cap) {
+    if (p) cudaFree(p);
+    p = nullptr;
+    cap = 0;
+    if (cudaMalloc(&p, n * sizeof(T)) != cudaSuccess) throw std::runtime_error("cuBLAS scratch: out of GPU memory");
+    cap = n;
+  }
+  return p;
+}
+
+__global__ void split_bf16_kernel(__nv_bfloat16* __restrict__ hi, __nv_bfloat16* __restrict__ lo,
+                                  const float* __restrict__ x, size_t n) {
+  const size_t i = size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (i >= n) return;
+  const float v = x[i];
+  const __nv_bfloat16 h = __float2bfloat16_rn(v);
+  hi[i] = h;
+  if (lo) lo[i] = __float2bfloat16_rn(v - __bfloat162float(h));
+}
+
+__global__ void add_bias_kernel(float* __restrict__ y, const float* __restrict__ bias, int N, size_t n) {
+  const size_t i = size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (i < n) y[i] += bias[i % N];
+}
+
+__global__ void silu_mul_kernel(float* __restrict__ out, const float* __restrict__ g,
+                                const float* __restrict__ u, size_t n) {
+  const size_t i = size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (i < n) out[i] = g[i] / (1.0f + expf(-g[i])) * u[i];
+}
+
+unsigned blocks_256(size_t n) { return unsigned((n + 255) / 256); }
+
+bool use_cublas(const DeviceMatrix& W, cudaStream_t stream) {
+  if (!g_cublas || W.int8) return false;
+  cudaStreamCaptureStatus st = cudaStreamCaptureStatusNone;
+  return cudaStreamIsCapturing(stream, &st) == cudaSuccess && st == cudaStreamCaptureStatusNone;
+}
+
+// x -> BF16 parts in g_x_hi (and g_x_lo in the exact mode), for every GEMM on this x.
+void cublas_prepare(const float* x, int T, int K, cudaStream_t stream) {
+  const size_t n = size_t(T) * K;
+  grow(g_x_hi, g_x_hi_cap, n);
+  if (!g_tc_fp16) grow(g_x_lo, g_x_lo_cap, n);
+  split_bf16_kernel<<<blocks_256(n), 256, 0, stream>>>(g_x_hi, g_tc_fp16 ? nullptr : g_x_lo, x, n);
+  cublas_check(cublasSetStream(g_cublas_handle, stream), "cublasSetStream");
+}
+
+// y[T, N] = beta * y + x·W^T (row-major), summed over x's parts. cuBLAS is
+// column-major, so this computes Y^T = W · X^T: W [N, K] row-major is a K x N
+// column-major matrix, used transposed; X [T, K] row-major is K x T column-major.
+void cublas_xwt(float* y, const DeviceMatrix& W, int T, float beta) {
+  const float one = 1.0f;
+  const __nv_bfloat16* parts[2] = {g_x_hi, g_x_lo};
+  for (int p = 0; p < (g_tc_fp16 ? 1 : 2); ++p) {
+    const float b = p == 0 ? beta : 1.0f;
+    cublas_check(cublasGemmEx(g_cublas_handle, CUBLAS_OP_T, CUBLAS_OP_N, W.rows, T, W.cols, &one,
+                              W.data, CUDA_R_16BF, W.cols, parts[p], CUDA_R_16BF, W.cols, &b, y,
+                              CUDA_R_32F, W.rows, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT),
+                 "cublasGemmEx");
+  }
+}
+
+void cublas_matmul(float* y, const float* x, const DeviceMatrix& W, const float* bias, int T,
+                   bool accumulate, cudaStream_t stream) {
+  cublas_prepare(x, T, W.cols, stream);
+  cublas_xwt(y, W, T, accumulate ? 1.0f : 0.0f);
+  const size_t n = size_t(T) * W.rows;
+  if (bias) add_bias_kernel<<<blocks_256(n), 256, 0, stream>>>(y, bias, W.rows, n);
+}
+
+void cublas_gate_up(float* out, const float* x, const DeviceMatrix& Wg, const DeviceMatrix& Wu,
+                    int T, cudaStream_t stream) {
+  cublas_prepare(x, T, Wg.cols, stream);
+  const size_t n = size_t(T) * Wg.rows;
+  cublas_xwt(grow(g_gate, g_gate_cap, n), Wg, T, 0.0f);
+  cublas_xwt(grow(g_up, g_up_cap, n), Wu, T, 0.0f);
+  silu_mul_kernel<<<blocks_256(n), 256, 0, stream>>>(out, g_gate, g_up, n);
+}
+
 // Decode (T = 1) streams the weights: one row per warp keeps the most loads in
 // flight. Small batches (T = 2..31) reuse each activation load for several rows.
 constexpr int kBatchRows = 4;     // rows per warp, matmul (T > 1)
@@ -1028,6 +1134,10 @@ void rmsnorm(float* y, const float* x, const float* weight, int T, int dim, floa
 
 void set_tensor_cores_impl(bool on) { g_tensor_cores = on; }
 void set_tc_fp16_impl(bool on) { g_tc_fp16 = on; }
+void set_cublas_impl(bool on) {
+  if (on && !g_cublas_handle) cublas_check(cublasCreate(&g_cublas_handle), "cublasCreate");
+  g_cublas = on;
+}
 bool tc_fp16() { return g_tc_fp16; }
 
 void init_matmul_workspace() {
@@ -1046,7 +1156,8 @@ bool tensor_cores() { return g_tensor_cores; }
 void matmul(float* y, const float* x, const DeviceMatrix& W, const float* bias, int T,
             bool accumulate, cudaStream_t stream) {
   if (use_tensor_cores(T, W.cols)) {
-    if (W.int8) launch_tc<Int8, false>(y, x, W, nullptr, bias, T, accumulate, stream);
+    if (use_cublas(W, stream)) cublas_matmul(y, x, W, bias, T, accumulate, stream);
+    else if (W.int8) launch_tc<Int8, false>(y, x, W, nullptr, bias, T, accumulate, stream);
     else launch_tc<Bf16, false>(y, x, W, nullptr, bias, T, accumulate, stream);
   } else {
     if (W.int8) launch_matmul<Int8>(y, x, W, bias, T, accumulate, stream);
@@ -1058,7 +1169,8 @@ void matmul(float* y, const float* x, const DeviceMatrix& W, const float* bias, 
 void gate_up_silu(float* out, const float* x, const DeviceMatrix& Wg, const DeviceMatrix& Wu,
                   int T, cudaStream_t stream) {
   if (use_tensor_cores(T, Wg.cols)) {
-    if (Wg.int8) launch_tc<Int8, true>(out, x, Wg, &Wu, nullptr, T, false, stream);
+    if (use_cublas(Wg, stream)) cublas_gate_up(out, x, Wg, Wu, T, stream);
+    else if (Wg.int8) launch_tc<Int8, true>(out, x, Wg, &Wu, nullptr, T, false, stream);
     else launch_tc<Bf16, true>(out, x, Wg, &Wu, nullptr, T, false, stream);
   } else {
     if (Wg.int8) launch_gate_up<Int8>(out, x, Wg, Wu, T, stream);

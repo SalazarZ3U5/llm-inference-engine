@@ -5,17 +5,16 @@ It loads Hugging Face `safetensors` weights and generates text on an NVIDIA GPU.
 
 Target model: **Qwen2.5-0.5B-Instruct** (download needs no license approval). Development GPU: RTX 4060 (sm_89, 8 GB).
 
-> Status: **all five phases done; prefill speed is the open item.** The whole forward pass runs on
-> an RTX 4060 with hand-written CUDA kernels and CUDA graphs: **213.8 tok/s decode with BF16** (211 GB/s, 97% of the
-> measured memory bandwidth) and **361.6 tok/s with INT8**, 127x the first working version, while still
-> matching Hugging Face at every layer. Prefill uses tensor cores and FlashAttention-style tiled
-> attention (**13,148 tok/s** on a 512-token prompt, **9,432 tok/s** on 4,000 tokens), and
-> flash-decoding keeps decode fast at long context (**~180 tok/s after a 4,000-token prompt**). A paged
-> KV cache and continuous batching serve many requests at once: **2,346 tok/s across 64 concurrent
-> requests** (2,485 with a 16-bit KV cache), 12.2x serving them one at a time, with every request's
-> output identical to serving it alone. `ie serve` exposes it as an OpenAI-compatible HTTP server.
-> On the same GPU, decode is within 3-5% of llama.cpp and 5.7x plain PyTorch; serving 64 requests with
-> `--tc-fp16`, 2,789 tok/s against llama.cpp's 2,555; prefill is about 57% of llama.cpp's speed
+> Status: **all five phases done; long-prompt prefill attention is the open item.** The whole
+> forward pass runs on an RTX 4060 with hand-written CUDA kernels and CUDA graphs: **213.8 tok/s decode
+> with BF16** (211 GB/s, 97% of the measured memory bandwidth) and **361.6 tok/s with INT8**, 127x the
+> first working version, while still matching Hugging Face at every layer. Prefill uses tensor cores and
+> FlashAttention-style tiled attention: **20,759 tok/s** on a 512-token prompt with `--tc-fp16` (within
+> 2.5% of the same matmuls done by NVIDIA's cuBLAS), 14,146 in the default exact mode. A paged KV cache
+> and continuous batching serve many requests at once: **2,791 tok/s across 64 concurrent requests**
+> (`--tc-fp16 --kv f16`), 13.9x serving them one at a time, with every request's output identical to
+> serving it alone; `ie serve` exposes it as an OpenAI-compatible HTTP server. On the same GPU, decode is
+> (BF16) within 3-6% of llama.cpp and 5.7x plain PyTorch, and serving 64 requests beats llama.cpp's 2,555 tok/s
 > ([comparison](#compared-with-llamacpp-and-pytorch)).
 
 ## Layout
@@ -167,7 +166,8 @@ print(reply.choices[0].message.content)
 
 Options: `--host` (default `127.0.0.1`), `--port`, `--max-batch N` (requests decoded together, default
 32), `--ctx N` (prompt + reply per request), `--kv-gb G`, `--kv f16` (16-bit KV cache: twice the
-tokens per GB), `--tc-fp16` (faster batched matmuls; both are worth using for serving), `--weights`;
+tokens per GB), `--tc-fp16` (faster prefill and batched matmuls; both are worth using for
+serving), `--weights`;
 the sampling options set the
 defaults for requests that leave them out. Besides the standard fields, requests accept `top_k` and
 `repetition_penalty`. `scripts\test_server.py` checks a plain and a streamed reply, a burst of
@@ -228,7 +228,10 @@ the model's default sampling (temperature 0.7, top-p 0.8, top-k 20): the first s
 - [x] FP16 KV cache option (`--kv f16`): half the cache memory and traffic, math still FP32;
       perplexity 14.7775 → 14.7776, serving 64 requests +6%
 - [x] Single-pass FP16 tensor-core option (`--tc-fp16`): half the tensor-core work and shared
-      memory per tile; perplexity 14.7775 → 14.7755, serving 64 requests +30% (2,152 → 2,789 tok/s)
+      memory per tile; perplexity 14.7775 → 14.7755, prefill +47% (14,146 → 20,759 tok/s on 512
+      tokens), serving 64 requests +31% (2,128 → 2,791 tok/s)
+- [x] cuBLAS yardstick (`--cublas`): prefill matmuls by NVIDIA's cuBLAS instead of the hand-written
+      kernel, same precision; the hand-written kernel is within 2.5% of it
 - [ ] Tensor-core (WMMA) version of the prefill attention
 - [ ] INT4 weight-only quantization
 - [x] Paged KV cache: 16-token pages from a shared pool, one page table per sequence; memory follows
@@ -249,20 +252,22 @@ the model's default sampling (temperature 0.7, top-p 0.8, top-k 20): the first s
 
 ## Compared with llama.cpp and PyTorch
 
-Same GPU (RTX 4060), same model, greedy decoding, 16-bit weights and KV cache everywhere:
-this engine with BF16 weights, both with its default exact tensor-core matmuls (two BF16 passes per
-tile, FP32-level accuracy) and with `--tc-fp16` (one FP16 pass, as the other two engines do);
-[llama.cpp](https://github.com/ggml-org/llama.cpp) build b12292 (CUDA, flash attention on) with
-Qwen's official FP16 GGUF; PyTorch + Hugging Face transformers in BF16 with SDPA attention (no
-`torch.compile`). `python scripts\compare.py --llama-dir <llama.cpp>` reruns everything and redraws
-the charts; raw numbers are in `docs/benchmarks.json`.
+Same GPU (RTX 4060), same model, greedy decoding, 16-bit weights and KV cache everywhere. This
+engine runs BF16 weights three ways: its default exact tensor-core matmuls (activations split into two
+BF16 halves, two passes per tile, FP32-level accuracy); `--tc-fp16` (one FP16 pass, as the other two
+engines do); and `--cublas --tc-fp16`, where NVIDIA's cuBLAS does the prefill matmuls instead of the
+hand-written kernel, as a yardstick. [llama.cpp](https://github.com/ggml-org/llama.cpp) build b12292
+(CUDA, flash attention on) runs Qwen's official FP16 GGUF; PyTorch + Hugging Face transformers runs
+BF16 with SDPA attention (no `torch.compile`). `python scripts\compare.py --llama-dir <llama.cpp>`
+reruns everything and redraws the charts; raw numbers are in `docs/benchmarks.json`.
 
-![One request: decode and prefill tokens/s for the three engines](docs/bench_single.png)
+![One request: decode and prefill tokens/s for each engine](docs/bench_single.png)
 
 | Engine | Prefill 512 tok/s | Decode @512 tok/s | Prefill 4,000 tok/s | Decode @4,000 tok/s |
 |---|--:|--:|--:|--:|
-| this engine (BF16) | 14,232 | 203.1 | 10,312 | 190.2 |
-| this engine (BF16, `--tc-fp16`) | 14,300 | 202.8 | 10,236 | 189.9 |
+| this engine (BF16, exact) | 14,146 | 199.5 | 10,189 | 187.4 |
+| this engine (BF16, `--tc-fp16`) | 20,759 | 197.1 | 13,212 | 185.2 |
+| this engine, cuBLAS prefill (`--cublas --tc-fp16`) | 21,267 | 202.8 | 12,973 | 190.0 |
 | llama.cpp (FP16 GGUF) | 25,059 | 209.8 | 25,550 | 197.1 |
 | PyTorch + transformers (BF16) | 13,756 | 35.3 | 20,303 | 35.5 |
 
@@ -273,39 +278,40 @@ Each request: a 512-token prompt and 128 generated tokens, all arriving together
 
 | Engine | 1 at once | 4 at once | 16 at once | 32 at once | 64 at once |
 |---|--:|--:|--:|--:|--:|
-| this engine (BF16) | 199 | 618 | 1,124 | 1,747 | 2,152 |
-| this engine (BF16, `--tc-fp16`) | **203** | 655 | 1,248 | **2,178** | **2,789** |
+| this engine (BF16, exact) | 195 | 605 | 1,111 | 1,713 | 2,128 |
+| this engine (BF16, `--tc-fp16`) | 201 | 646 | 1,198 | **2,176** | **2,791** |
+| this engine, cuBLAS prefill (`--cublas --tc-fp16`) | 203 | 658 | 1,257 | 2,215 | 2,804 |
 | llama.cpp (FP16 GGUF) | 183 | 655 | 1,632 | 2,154 | 2,555 |
 | PyTorch + transformers (BF16) | 33 | 128 | 489 | 893 | 1,584 |
 
 | 8-bit weights, one request | Prefill 512 tok/s | Decode @512 tok/s |
 |---|--:|--:|
-| this engine (INT8, per-row scales) | 12,265 | 327.7 |
+| this engine (INT8, per-row scales) | 10,907 | 309.3 |
 | llama.cpp (Q8_0) | 30,802 | 344.4 |
 
 What the numbers say:
 
-- **Decode is within 3-5% of llama.cpp** (BF16 203 vs 210 tok/s, INT8 328 vs 344) and 5.7x plain
-  PyTorch. Decoding one sequence is limited by how fast the weights stream from memory, and both
+- **BF16 decode is within 3-6% of llama.cpp** (197-203 vs 210 tok/s across runs) and 5.7x plain
+  PyTorch; INT8 is 5-10% behind Q8_0 (309-328 vs 344 tok/s across runs). Decoding one sequence is limited by how fast the weights stream from memory, and both
   engines are close to that limit; PyTorch loses to the per-token Python and kernel-launch overhead
   that CUDA graphs remove here.
-- **Serving many requests: with `--tc-fp16`, ahead of llama.cpp at 1, 32 and 64 requests** (2,789 vs
-  2,555 tok/s at 64), level at 4, behind at 16 (1,248 vs 1,632). Batches of 32+ run their matmuls on
-  the tensor cores, and the single-pass kernel is lighter (fewer registers, half the shared memory),
-  so more blocks fit on each SM: +30% at 64 requests over the exact mode. Perplexity is unchanged
-  (14.7775 exact, 14.7755 with `--tc-fp16`). Batches of 2-31 use the CUDA-core kernel, which is why
-  16 requests is the weak point. Plain PyTorch is behind at every size.
-- **Prefill is about 57% of llama.cpp's speed** (14,232 vs 25,059 tok/s on 512 tokens; 10,312 vs
-  25,550 on 4,000). Halving the tensor-core work with `--tc-fp16` changes nothing here, so the math
-  is not the bottleneck: this engine's GEMM is a plain 64 x 64-tile WMMA kernel that loads FP32
-  activations and converts them for every tile, and it is limited by moving data rather than by the
-  tensor cores, where cuBLAS and llama.cpp use larger tiles, lower-level MMA instructions and 16-bit
-  activations between layers. At 4,000 tokens, prefill attention (on CUDA cores here, tensor-core
-  flash attention in llama.cpp) widens the gap.
+- **The hand-written tensor-core matmul is within 2.5% of cuBLAS.** With the same precision
+  (`--tc-fp16`), prefill is 20,759 tok/s with this engine's kernel and 21,267 with cuBLAS on 512
+  tokens, and level on 4,000. The default exact mode pays for its FP32-level accuracy with two passes
+  per tile: prefill 14,146 vs 20,759 tok/s, for a perplexity difference of 0.002 (14.7775 vs 14.7755).
+- **Prefill against llama.cpp: 83% on 512 tokens, 52% on 4,000** (with `--tc-fp16`). Since the
+  matmuls match cuBLAS, the rest is elsewhere: prefill attention runs on CUDA cores here and on tensor
+  cores in llama.cpp, which costs little on short prompts and dominates long ones; activations between
+  layers are also kept in FP32 here (llama.cpp uses 16 bits), so every kernel moves twice the bytes.
+- **Serving many requests: with `--tc-fp16`, ahead of llama.cpp at 1, 32 and 64 requests** (2,791 vs
+  2,555 tok/s at 64), level at 4, behind at 16 (1,198 vs 1,632). Batches of 32+ run on the tensor cores
+  with the lighter single-pass kernel; batches of 2-31 use the CUDA-core kernel, which keeps results
+  bit-identical to running alone but is slower, which is why 16 requests is the weak point. cuBLAS
+  prefill adds almost nothing here (2,804): the decode steps dominate this workload. Plain PyTorch is
+  behind at every size.
 
-The open item is therefore the prefill GEMM itself: larger tiles, `ldmatrix`/`mma.sync` instead of
-WMMA, asynchronous copies, and keeping activations in 16 bits between layers; then tensor cores in
-prefill attention.
+The open item is therefore prefill attention on tensor cores (FlashAttention-2 style), then 16-bit
+activations between layers; the matmul kernel itself is not the bottleneck.
 
 ## Performance log
 
@@ -337,6 +343,8 @@ prefill attention.
 | 2026-11-11 | GPU: FP16 KV cache, 4,000-token prompt | 173.9 | 9755.4 | within run-to-run noise of FP32 for one sequence |
 | 2026-11-11 | **`ie serve` (HTTP, sampling), 16 simultaneous requests** | **1039.2** | - | first streamed text after 11 ms; greedy reply identical alone and under load |
 | 2026-11-12 | **GPU: `--tc-fp16`, 64 requests of 512 + 128 tokens (llama.cpp: 2,555)** | **2788.9** | - | +30% over the exact mode; perplexity 14.7755 |
+| 2026-11-12 | **GPU: `--tc-fp16`, 512-token prompt (llama.cpp: 25,059)** | 197.1 | **20759.0** | prefill +47% over the exact mode (14,146) |
+| 2026-11-12 | GPU: `--cublas --tc-fp16`, 512-token prompt | 202.8 | 21267.1 | the hand-written matmul is within 2.5% of cuBLAS |
 
 Full sweep (`ie bench --sweep`, 64-token prompt, 32 generated tokens) on a Ryzen 5 3600XT
 (6 cores / 12 threads, AVX2, dual-channel DDR4) and an RTX 4060 (8 GB):

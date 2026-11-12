@@ -13,8 +13,9 @@ Workloads (greedy decoding, every engine on the GPU, 16-bit weights and KV cache
 
 Engines:
   - this engine: `ie bench` and `ie serve-bench --same-length`, BF16 weights, FP16 KV cache,
-    twice: with its default exact tensor-core matmuls (two BF16 passes) and with --tc-fp16
-    (one FP16 pass, as the other two engines do)
+    three times: with its default exact tensor-core matmuls (two BF16 passes), with --tc-fp16
+    (one FP16 pass, as the other two engines do), and with --cublas --tc-fp16 (prefill matmuls
+    by NVIDIA's cuBLAS in one BF16 pass: how far the hand-written kernel is from the vendor's)
   - llama.cpp: a prebuilt CUDA release (llama-bench, llama-batched-bench), the official
     FP16 and Q8_0 GGUF files (downloaded into models/gguf once), flash attention on
   - PyTorch: Hugging Face transformers, BF16, SDPA attention, no torch.compile
@@ -44,14 +45,16 @@ BATCH_PROMPT = 512
 GGUF_REPO = "Qwen/Qwen2.5-0.5B-Instruct-GGUF"
 GGUF_FILES = {"f16": "qwen2.5-0.5b-instruct-fp16.gguf", "q8_0": "qwen2.5-0.5b-instruct-q8_0.gguf"}
 
-ENGINES = ["this engine", "this engine, FP16 tc", "llama.cpp", "PyTorch"]  # table order
+ENGINES = ["this engine", "this engine, FP16 tc", "this engine, cuBLAS", "llama.cpp", "PyTorch"]
 # Chart order: neighbouring bars must be easy to tell apart (orange and yellow side by side
 # fail the palette check), so the FP16 variant goes last, next to aqua.
-CHART_ORDER = ["this engine", "llama.cpp", "PyTorch", "this engine, FP16 tc"]
-IE_VARIANTS = {"this engine": [], "this engine, FP16 tc": ["--tc-fp16"]}
+CHART_ORDER = ["this engine", "llama.cpp", "PyTorch", "this engine, FP16 tc", "this engine, cuBLAS"]
+IE_VARIANTS = {"this engine": [], "this engine, FP16 tc": ["--tc-fp16"],
+               "this engine, cuBLAS": ["--cublas", "--tc-fp16"]}
 LABELS = {  # what each engine runs, for the tables
     "this engine": "this engine (BF16)",
     "this engine, FP16 tc": "this engine (BF16, --tc-fp16)",
+    "this engine, cuBLAS": "this engine, cuBLAS prefill (BF16, --cublas --tc-fp16)",
     "llama.cpp": "llama.cpp (FP16 GGUF)",
     "PyTorch": "PyTorch + transformers (BF16)",
 }
@@ -265,7 +268,7 @@ def tables(r):
 
 # Reference categorical palette, slots 1-3 in fixed order; text in ink colors, never series colors.
 COLORS = {"this engine": "#2a78d6", "llama.cpp": "#eb6834", "PyTorch": "#1baf7a",
-          "this engine, FP16 tc": "#eda100"}
+          "this engine, FP16 tc": "#eda100", "this engine, cuBLAS": "#e87ba4"}
 SURFACE, INK, INK_2, GRID = "#fcfcfb", "#0b0b0b", "#52514e", "#e4e3df"
 
 
@@ -305,17 +308,17 @@ def charts(r):
                               label=LABELS[e])
                 for bar, v in zip(bars, vals):
                     ax.text(bar.get_x() + bar.get_width() / 2, v, f"{v:,.0f}", ha="center",
-                            va="bottom", fontsize=8.5, color=INK_2)
+                            va="bottom", fontsize=8.5 if len(engines) <= 3 else 7, color=INK_2)
             ax.set_xticks(range(len(PROMPTS)))
             ax.set_xticklabels([f"{p:,}-token prompt" for p in PROMPTS])
             ax.yaxis.set_major_formatter(thousands)
             ax.set_title(title, loc="left", fontsize=11, color=INK)
         handles, labels = axes[0].get_legend_handles_labels()
-        fig.legend(handles, labels, frameon=False, loc="lower center", ncol=min(len(engines), 4),
+        fig.legend(handles, labels, frameon=False, loc="lower center", ncol=min(len(engines), 3),
                    fontsize=9)
         fig.suptitle(f"Qwen2.5-0.5B-Instruct on an {gpu}, greedy, 16-bit weights", x=0.01, ha="left",
                      fontsize=12, color=INK)
-        fig.tight_layout(rect=(0, 0.08, 1, 1))
+        fig.tight_layout(rect=(0, 0.12 if len(engines) > 3 else 0.08, 1, 1))
         fig.savefig(DOCS / "bench_single.png", dpi=200, facecolor=SURFACE)
         plt.close(fig)
 
@@ -325,13 +328,21 @@ def charts(r):
     if engines:
         fig, ax = plt.subplots(figsize=(10, 4.6), facecolor=SURFACE)
         style(ax)
+        ends = []  # (last value, x) per line, labelled after drawing
         for e in engines:
             ns = [n for n in BATCHES if str(n) in b[e]]
             vals = [b[e][str(n)] for n in ns]
             ax.plot(ns, vals, color=COLORS[e], linewidth=2, marker="o", markersize=6,
                     markeredgecolor=SURFACE, markeredgewidth=1.5, label=LABELS[e])
-            ax.annotate(f"{vals[-1]:,.0f}", (ns[-1], vals[-1]), xytext=(8, 0),
-                        textcoords="offset points", va="center", fontsize=9, color=INK_2)
+            ends.append((vals[-1], ns[-1]))
+        # End labels, pushed apart where lines finish close together.
+        gap = 0.045 * max(v for v, _ in ends)
+        placed = []
+        for v, x in sorted(ends):
+            y = v if not placed or v - placed[-1] >= gap else placed[-1] + gap
+            placed.append(y)
+            ax.annotate(f"{v:,.0f}", (x, v), xytext=(x * 1.1, y), textcoords="data", va="center",
+                        fontsize=9, color=INK_2)
         ax.set_xscale("log", base=2)
         ax.set_xticks(BATCHES)
         ax.set_xticklabels([str(n) for n in BATCHES])
