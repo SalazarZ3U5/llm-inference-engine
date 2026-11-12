@@ -992,6 +992,16 @@ int run_selftest() {
                           kv, NH, NKV, HD, s);
         std::snprintf(what, sizeof(what), "prefill attention: %s", name);
         tally.add(what, download(dout2, want.size()), want);
+
+        // The tensor-core version (--tc-fp16): Q, K, V and the probabilities are
+        // rounded to FP16 (11 significant bits), so allow ~1e-3 relative error.
+        set_tc_fp16_impl(true);
+        float* dout3 = mem.alloc<float>(want.size());
+        attention_prefill(dout3, mem.upload(q), dkp, dvp, T, mem.upload(row_pos), mem.upload(row_seq),
+                          kv, NH, NKV, HD, s);
+        set_tc_fp16_impl(false);
+        std::snprintf(what, sizeof(what), "prefill attention, tensor cores: %s", name);
+        tally.add(what, download(dout3, want.size()), want, 5e-3);
       }
     }
   }

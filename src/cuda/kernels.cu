@@ -623,6 +623,158 @@ attention_prefill_kernel(float* __restrict__ out, const float* __restrict__ q,
         make_float4(acc[4 * c] * inv_l, acc[4 * c + 1] * inv_l, acc[4 * c + 2] * inv_l, acc[4 * c + 3] * inv_l);
 }
 
+// --------------------------------------- prefill attention, tensor cores ----
+//
+// The same prompt attention as above with the two big products on tensor cores,
+// FlashAttention-2 style (used with --tc-fp16; the default keeps the FP32 kernel
+// above). A block takes 64 consecutive prompt tokens of one query head; each of
+// its 4 warps owns 16 of those query rows. For every tile of 64 cached
+// positions:
+//   S = Q·K^T     16 x 64 scores per warp, FP16 inputs, FP32 sums (tensor cores)
+//   softmax       running max / sum per row in FP32, exactly as in the kernel above;
+//                 P = exp(S - max) rounded to FP16
+//   O += P·V      16 x 64 outputs per warp (tensor cores), added in FP32
+// The running output stays in registers: two lanes per query row, 32 values
+// each. (A tensor-core accumulator's element-to-row layout isn't specified, so
+// products go through shared memory to reach the lanes that own each row.)
+
+constexpr int kTaQ = 64;               // query tokens per block
+constexpr int kTaKeys = 64;            // cached positions per tile
+constexpr int kTaWarps = kTaQ / 16;    // 4 warps, 16 query rows each
+constexpr int kTaLd = kPfDim + 8;      // FP16 row stride in shared memory (pads bank conflicts)
+constexpr int kTaLdS = kTaKeys + 4;    // FP32 row stride of the per-warp score / product tile
+
+template <class KV>
+__global__ void __launch_bounds__(kTaWarps * 32)
+attention_prefill_tc_kernel(float* __restrict__ out, const float* __restrict__ q,
+                            const KV* __restrict__ k_pool, const KV* __restrict__ v_pool, int T,
+                            const int* __restrict__ row_pos, const int* __restrict__ row_seq,
+                            KvLayout kv, int n_heads, int n_kv_heads) {
+  namespace wm = nvcuda::wmma;
+  constexpr int D = kPfDim;
+  __shared__ __align__(32) __half ks[kTaKeys * kTaLd];             // K tile (first: the Q tile)
+  __shared__ __align__(32) __half vs[kTaKeys * kTaLd];             // V tile
+  __shared__ __align__(32) float sbuf[kTaWarps][16 * kTaLdS];      // per warp: scores, then P·V
+  __shared__ __align__(32) __half pbuf[kTaWarps][16 * kTaLd];      // per warp: probabilities
+
+  const int h = blockIdx.y, kvh = h / (n_heads / n_kv_heads);
+  const int t0 = blockIdx.x * kTaQ;
+  const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+  const int seq = row_seq[0];
+  const int max_pos = row_pos[min(t0 + kTaQ, T) - 1];  // positions increase by 1 per row
+  const int q_dim = n_heads * D, kv_dim = n_kv_heads * D;
+
+  // Q tile -> FP16, scaled by 1/sqrt(64) = 0.125 (exact in FP16), staged in ks.
+  for (int i = threadIdx.x; i < kTaQ * D / 4; i += blockDim.x) {
+    const int r = i / (D / 4), c = (i % (D / 4)) * 4;
+    float4 v = make_float4(0.f, 0.f, 0.f, 0.f);
+    if (t0 + r < T) v = *reinterpret_cast<const float4*>(q + size_t(t0 + r) * q_dim + h * D + c);
+    __half2* dst = reinterpret_cast<__half2*>(ks + r * kTaLd + c);
+    dst[0] = __floats2half2_rn(v.x * 0.125f, v.y * 0.125f);
+    dst[1] = __floats2half2_rn(v.z * 0.125f, v.w * 0.125f);
+  }
+  __syncthreads();
+  wm::fragment<wm::matrix_a, 16, 16, 16, __half, wm::row_major> qf[D / 16];
+#pragma unroll
+  for (int kk = 0; kk < D / 16; ++kk) wm::load_matrix_sync(qf[kk], ks + warp * 16 * kTaLd + kk * 16, kTaLd);
+
+  // This lane's query row (two lanes per row) and its half of the 64 columns.
+  const int r = lane >> 1, c0 = (lane & 1) * 32;
+  const int t = t0 + warp * 16 + r;
+  const int pos = t < T ? row_pos[t] : -1;  // -1: padding row, sees nothing
+  float o[32];
+#pragma unroll
+  for (int j = 0; j < 32; ++j) o[j] = 0.0f;
+  float m = -INFINITY, l = 0.0f;
+  float* sw = sbuf[warp];
+  __half* pw = pbuf[warp];
+
+  for (int s0 = 0; s0 <= max_pos; s0 += kTaKeys) {
+    __syncthreads();  // everyone is done with the previous K/V tile (or with Q)
+    for (int i = threadIdx.x; i < kTaKeys * D / 4; i += blockDim.x) {
+      const int j = i / (D / 4), c = (i % (D / 4)) * 4;
+      const int sp = min(s0 + j, max_pos);  // past the end: a valid row, masked below
+      const size_t off = kv_offset(kv, seq, sp, kv_dim) + kvh * D + c;
+      const float4 kk4 = kv_load4(k_pool + off), vv4 = kv_load4(v_pool + off);
+      __half2* kd = reinterpret_cast<__half2*>(ks + j * kTaLd + c);
+      __half2* vd = reinterpret_cast<__half2*>(vs + j * kTaLd + c);
+      kd[0] = __floats2half2_rn(kk4.x, kk4.y);
+      kd[1] = __floats2half2_rn(kk4.z, kk4.w);
+      vd[0] = __floats2half2_rn(vv4.x, vv4.y);
+      vd[1] = __floats2half2_rn(vv4.z, vv4.w);
+    }
+    __syncthreads();
+
+    // S = Q·K^T. ks holds K as [key][dim], i.e. K^T as a column-major dim x key matrix.
+#pragma unroll
+    for (int j = 0; j < kTaKeys / 16; ++j) {
+      wm::fragment<wm::accumulator, 16, 16, 16, float> acc;
+      wm::fill_fragment(acc, 0.0f);
+#pragma unroll
+      for (int kk = 0; kk < D / 16; ++kk) {
+        wm::fragment<wm::matrix_b, 16, 16, 16, __half, wm::col_major> kf;
+        wm::load_matrix_sync(kf, ks + j * 16 * kTaLd + kk * 16, kTaLd);
+        wm::mma_sync(acc, qf[kk], kf, acc);
+      }
+      wm::store_matrix_sync(sw + j * 16, acc, kTaLdS, wm::mem_row_major);
+    }
+    __syncwarp();
+
+    // Online softmax for this lane's row, over its 32 columns (+ its partner's).
+    float sc[32];
+    float tile_max = -INFINITY;
+#pragma unroll
+    for (int j = 0; j < 32; ++j) {
+      const float v = sw[r * kTaLdS + c0 + j];
+      sc[j] = s0 + c0 + j <= pos ? v : -INFINITY;  // causal mask
+      tile_max = fmaxf(tile_max, sc[j]);
+    }
+    tile_max = fmaxf(tile_max, __shfl_xor_sync(0xffffffffu, tile_max, 1));
+    const float m_new = fmaxf(m, tile_max);
+    const bool none = m_new == -INFINITY;  // padding row: nothing visible, ever
+    const float corr = none ? 1.0f : expf(m - m_new);
+    float sum = 0.0f;
+#pragma unroll
+    for (int j = 0; j < 32; j += 2) {
+      const float p0 = none ? 0.0f : expf(sc[j] - m_new), p1 = none ? 0.0f : expf(sc[j + 1] - m_new);
+      sum += p0 + p1;
+      *reinterpret_cast<__half2*>(pw + r * kTaLd + c0 + j) = __floats2half2_rn(p0, p1);
+    }
+    sum += __shfl_xor_sync(0xffffffffu, sum, 1);
+    l = l * corr + sum;
+    m = m_new;
+    __syncwarp();
+
+    // P·V into sw (the scores are no longer needed), then into this lane's outputs.
+#pragma unroll
+    for (int j = 0; j < D / 16; ++j) {
+      wm::fragment<wm::accumulator, 16, 16, 16, float> acc;
+      wm::fill_fragment(acc, 0.0f);
+#pragma unroll
+      for (int kk = 0; kk < kTaKeys / 16; ++kk) {
+        wm::fragment<wm::matrix_a, 16, 16, 16, __half, wm::row_major> pf;
+        wm::fragment<wm::matrix_b, 16, 16, 16, __half, wm::row_major> vf;
+        wm::load_matrix_sync(pf, pw + kk * 16, kTaLd);
+        wm::load_matrix_sync(vf, vs + kk * 16 * kTaLd + j * 16, kTaLd);
+        wm::mma_sync(acc, pf, vf, acc);
+      }
+      wm::store_matrix_sync(sw + j * 16, acc, kTaLdS, wm::mem_row_major);
+    }
+    __syncwarp();
+#pragma unroll
+    for (int j = 0; j < 32; ++j) o[j] = o[j] * corr + sw[r * kTaLdS + c0 + j];
+    __syncwarp();  // sw is overwritten by the next tile's scores
+  }
+
+  if (pos < 0) return;
+  const float inv_l = 1.0f / l;
+  float* dst = out + size_t(t) * q_dim + h * D + c0;
+#pragma unroll
+  for (int j = 0; j < 32; j += 4)
+    *reinterpret_cast<float4*>(dst + j) =
+        make_float4(o[j] * inv_l, o[j + 1] * inv_l, o[j + 2] * inv_l, o[j + 3] * inv_l);
+}
+
 __global__ void gather_rows_kernel(float* __restrict__ dst, const float* __restrict__ src,
                                    const int* __restrict__ rows, int dim) {
   const float* in = src + size_t(rows[blockIdx.x]) * dim;
@@ -1206,6 +1358,19 @@ void attention_prefill(float* out, const float* q, const void* k_pool, const voi
   if (!attention_prefill_supported(n_heads, n_kv_heads, head_dim))
     throw std::runtime_error("attention_prefill: needs head_dim 64 and at most 8 query heads per KV head");
   if (kv.page_size != kKvPageSize) throw std::runtime_error("attention_prefill: KV page size must be 16");
+  if (g_tc_fp16) {  // the 16-bit fast mode: tensor cores (head_dim 64 is checked above)
+    const dim3 tgrid((T + kTaQ - 1) / kTaQ, n_heads);
+    if (kv.f16)
+      attention_prefill_tc_kernel<__half><<<tgrid, kTaWarps * 32, 0, stream>>>(
+          out, q, static_cast<const __half*>(k_pool), static_cast<const __half*>(v_pool), T,
+          row_pos, row_seq, kv, n_heads, n_kv_heads);
+    else
+      attention_prefill_tc_kernel<float><<<tgrid, kTaWarps * 32, 0, stream>>>(
+          out, q, static_cast<const float*>(k_pool), static_cast<const float*>(v_pool), T,
+          row_pos, row_seq, kv, n_heads, n_kv_heads);
+    check_launch("attention_prefill_tc");
+    return;
+  }
   const dim3 grid((T + kPfQ - 1) / kPfQ, n_kv_heads);
   const float scale = 1.0f / sqrtf(float(head_dim));
   if (kv.f16)
